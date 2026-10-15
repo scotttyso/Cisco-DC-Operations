@@ -1,0 +1,28 @@
+[Unit]
+Description=Cisco DC Operations
+Wants=network-online.target
+After=network-online.target cisco-dc-firstboot.service
+
+[Service]
+Type=simple
+User=cisco-dc-automation
+Group=cisco-dc-automation
+WorkingDirectory=/opt/cisco-dc-automation
+ExecStart=/opt/cisco-dc-automation/.venv/bin/python /opt/cisco-dc-automation/automation_ui.py --host 127.0.0.1 --port 8088 --secure-cookies
+Environment=PYTHONUNBUFFERED=1
+Environment=DC_AUTOMATION_DATA=/var/lib/cisco-dc-automation
+Environment=DC_AUTOMATION_KEY_FILE=/var/lib/cisco-dc-automation-key/vault.key
+Environment=DC_NXOS_SCRIPTS_DIR=/opt/cisco-dc-automation/nxos-scripts
+EnvironmentFile=-/etc/cisco-dc-automation/service.env
+StateDirectory=cisco-dc-automation cisco-dc-automation-key
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

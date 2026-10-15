@@ -1,0 +1,15 @@
+[Unit]
+Description=Initialize Cisco DC Operations Appliance
+Wants=network-online.target
+After=network-online.target cloud-final.service
+Before=nginx.service cisco-dc-automation.service
+ConditionPathExists=/etc/cisco-dc-automation/build.env
+ConditionPathExists=!/etc/cisco-dc-automation/.configured
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cisco-dc-config --firstboot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

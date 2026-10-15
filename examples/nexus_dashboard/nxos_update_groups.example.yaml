@@ -1,0 +1,16 @@
+nexus_dashboard:
+  host: nd.example.com
+  username: netops
+  domain: local
+  verify_ssl: true
+  password_env: DC_ND_PASSWORD
+
+update_groups:
+  leaf-fx-10_6_4:
+    hosts:
+      - leaf101
+      - leaf102
+  border-ex-10_3_10:
+    hosts:
+      - 192.0.2.21
+      - 192.0.2.22

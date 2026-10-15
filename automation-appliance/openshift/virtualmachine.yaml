@@ -1,0 +1,59 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cisco-dc-automation
+  namespace: cisco-dc-automation
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: cisco-dc-automation-root
+      spec:
+        source:
+          pvc:
+            namespace: cisco-dc-images
+            name: cisco-dc-automation-rocky10
+        storage:
+          resources:
+            requests:
+              storage: 64Gi
+  template:
+    metadata:
+      labels:
+        app: cisco-dc-automation
+    spec:
+      domain:
+        machine:
+          type: q35
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+        cpu:
+          cores: 4
+        resources:
+          requests:
+            memory: 8Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: management
+              bridge: {}
+      networks:
+        - name: management
+          multus:
+            networkName: dc-management
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: cisco-dc-automation-root
+        - name: cloudinit
+          cloudInitNoCloud:
+            secretRef:
+              name: cisco-dc-cloudinit

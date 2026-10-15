@@ -1,0 +1,13 @@
+vsphere_server              = "vcenter.example.com"
+vsphere_username            = "administrator@vsphere.local"
+vsphere_datacenter          = "Datacenter"
+vsphere_cluster             = "Cluster"
+vsphere_datastore           = "datastore1"
+vsphere_network             = "Build Network"
+vsphere_folder              = "Templates"
+vsphere_insecure_connection = false
+iso_paths                   = ["[datastore1] iso/Rocky-10.2-x86_64-dvd1.iso"]
+vm_name                     = "cisco-dc-automation-rocky10"
+build_username              = "dcadmin"
+appliance_version           = "1.0.0"
+build_qcow2                 = true
