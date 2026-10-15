@@ -26,9 +26,10 @@ Use HTTPS for access beyond local development; see
 [automation-appliance/README.md](automation-appliance/README.md).
 
 For customer deployment on a physical Ubuntu 26.04 server, follow
-[docs/deploy_ubuntu_baremetal.md](docs/deploy_ubuntu_baremetal.md). Customer bare-metal
-and VM access uses **HTTPS on port 443**; HTTP on localhost:8088 is an internal
-proxy hop only. The HTTP development URL above is not the customer deployment.
+[docs/deploy_ubuntu_baremetal.md](docs/deploy_ubuntu_baremetal.md). Bare-metal uses
+HTTPS on port 443 by default, or 8443 when sharing an existing Nginx listener. The
+standalone VM uses HTTPS on port 443. HTTP on localhost:8088 is an internal proxy
+hop only. The HTTP development URL above is not the customer deployment.
 
 ### Navigation
 

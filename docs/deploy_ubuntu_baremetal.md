@@ -1,8 +1,9 @@
 # Ubuntu 26 Bare-Metal Deployment
 
-Deploy **Cisco DC Operations** on a dedicated **Ubuntu Server 26.04 LTS** physical
-server. Customer access is **HTTPS on TCP 443**, with Nginx terminating TLS and
-proxying to the application on **127.0.0.1:8088**. The backend's loopback-only HTTP
+Deploy **Cisco DC Operations** on an **Ubuntu Server 26.04 LTS** physical server.
+Use **HTTPS on TCP 443** on a dedicated host. If an existing Nginx service already
+uses 443, add the app to that Nginx on **HTTPS TCP 8443** instead. Nginx terminates
+TLS and proxies to the application on **127.0.0.1:8088**; that loopback-only HTTP
 connection is not a customer endpoint. Session cookies require HTTPS and the UI's
 live connection uses secure WebSockets through Nginx.
 
@@ -25,7 +26,8 @@ scripts on bare metal.** In particular, do not run
 - A management IP, DNS name, working DNS resolution, accurate time, and sudo access.
 - A customer-approved TLS certificate/full chain and matching private key.
 - Approved Ubuntu/Python package repositories, or a compatible offline wheelhouse.
-- Browser access to HTTPS 443 from the permitted management networks.
+- Browser access to HTTPS 443 (dedicated host) or 8443 (shared Nginx host) from
+  permitted management networks.
 - Server-to-APIC/ND HTTPS 443; direct switch SSH 22, or ND rescue-user SSH 22 and
   ND-to-switch SSH 22. APIC/ND API calls remain direct, not tunneled through ND.
 - Switch-to-SCP-server connectivity for bootflash staging. This app need not host images.
@@ -58,13 +60,21 @@ All remaining commands run **on the Ubuntu server**, in a Bash shell, not inside
 a switch CLI. Set the real server values in that shell:
 
 ```bash
-APP_FQDN=dc-ops.customer.example
+APP_FQDN=existing-host.customer.example
+APP_PORT=8443
 SERVER_IP=192.0.2.10
+TLS_CERT=/etc/ssl/certs/cisco-dc-automation.crt
+TLS_KEY=/etc/ssl/private/cisco-dc-automation.key
 cat /etc/os-release
 sudo apt-get update
 sudo apt-get install -y python3 python3-venv python3-pip openssh-client nginx openssl ca-certificates curl
 python3 --version
 ```
+
+For a shared Semaphore host, set `APP_FQDN` to the hostname already used to reach
+that server, `APP_PORT=8443`, and `TLS_CERT`/`TLS_KEY` to the existing Nginx
+certificate files if that certificate covers the hostname. This requires no new
+DNS name. For a dedicated host, choose its app DNS name and set `APP_PORT=443`.
 
 The app requires Python 3.10+. Ubuntu 26's newer interpreter/dependency combination
 still requires validation. Do not replace system Python, install app packages into
@@ -120,25 +130,28 @@ Use the customer's trusted certificate process. Replace these source paths with
 the full certificate chain and matching private key for `APP_FQDN`:
 
 ```bash
-sudo install -o root -g root -m 0644 /path/to/fullchain.pem /etc/ssl/certs/cisco-dc-automation.crt
-sudo install -o root -g root -m 0600 /path/to/private-key.pem /etc/ssl/private/cisco-dc-automation.key
-sudo openssl x509 -in /etc/ssl/certs/cisco-dc-automation.crt -noout -subject -issuer -dates
+sudo install -o root -g root -m 0644 /path/to/fullchain.pem "$TLS_CERT"
+sudo install -o root -g root -m 0600 /path/to/private-key.pem "$TLS_KEY"
+sudo openssl x509 -in "$TLS_CERT" -noout -subject -issuer -dates
 ```
 
 Nginx must be able to load the key non-interactively at service start. Protect the
 key and arrange certificate renewal/reload with the customer. For an internal CA,
 distribute CA trust to administrator browsers through the approved process.
+On a shared host, you may point `TLS_CERT` and `TLS_KEY` at the existing Nginx
+files if the certificate covers `APP_FQDN`; reuse those paths directly instead of
+copying the private key. Never replace Semaphore's certificate or key.
 
 For **temporary testing only**, a self-signed certificate can be generated after
 setting the real `APP_FQDN` and `SERVER_IP`:
 
 ```bash
 sudo openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 30 \
-  -keyout /etc/ssl/private/cisco-dc-automation.key \
-  -out /etc/ssl/certs/cisco-dc-automation.crt \
+  -keyout "$TLS_KEY" \
+  -out "$TLS_CERT" \
   -subj "/CN=${APP_FQDN}" \
   -addext "subjectAltName=DNS:${APP_FQDN},IP:${SERVER_IP}"
-sudo chmod 0600 /etc/ssl/private/cisco-dc-automation.key
+sudo chmod 0600 "$TLS_KEY"
 ```
 
 Verify its fingerprint out of band before trusting it. Replace it with the
@@ -147,21 +160,31 @@ globally or train users to ignore arbitrary certificate warnings.
 
 ## 6. Configure Nginx HTTPS and WebSockets
 
-Adapt the supplied proxy config to Ubuntu's certificate paths and real hostname:
+If this host already serves Semaphore on HTTPS 443, keep its existing Nginx
+service and site configuration and add Cisco DC Operations on port 8443. Use the
+same hostname as Semaphore in `APP_FQDN`; the URL is
+`https://${APP_FQDN}:8443/`. The existing certificate must cover that hostname.
+This needs no new DNS name and leaves Semaphore on 443. Nginx serves both ports
+from its existing service; do not start another Nginx instance or change the
+Semaphore site.
+
+Adapt the supplied proxy config for the selected port, certificate paths, and
+hostname:
 
 ```bash
 sed \
+  -e "s|listen 443 ssl;|listen ${APP_PORT} ssl;|" \
   -e "s|server_name _;|server_name ${APP_FQDN};|" \
-  -e 's|/etc/pki/nginx/cisco-dc-automation.crt|/etc/ssl/certs/cisco-dc-automation.crt|' \
-  -e 's|/etc/pki/nginx/private/cisco-dc-automation.key|/etc/ssl/private/cisco-dc-automation.key|' \
+  -e "s|/etc/pki/nginx/cisco-dc-automation.crt|${TLS_CERT}|" \
+  -e "s|/etc/pki/nginx/private/cisco-dc-automation.key|${TLS_KEY}|" \
   ~/cisco-dc-operations-source/automation-appliance/nginx-cisco-dc.conf \
   | sudo tee /etc/nginx/sites-available/cisco-dc-operations >/dev/null
 sudo ln -s /etc/nginx/sites-available/cisco-dc-operations /etc/nginx/sites-enabled/cisco-dc-operations
 sudo nginx -t
 ```
 
-On a fresh **dedicated** server, disable Ubuntu's unused default HTTP site after
-confirming it hosts nothing the customer needs:
+Only on a fresh **dedicated** server, disable Ubuntu's unused default HTTP site
+after confirming it hosts nothing the customer needs:
 
 ```bash
 if [[ -L /etc/nginx/sites-enabled/default ]]; then
@@ -170,9 +193,11 @@ fi
 sudo nginx -t
 ```
 
-Do not remove existing customer sites or create competing listeners on a shared
-web server. The application site serves HTTPS 443 only; this procedure does not
-open port 80. If HTTP-to-HTTPS redirection is desired, arrange it separately.
+For a shared Semaphore host, do not unlink the default site or edit/replace the
+Semaphore server block. The new listener on 8443 is added alongside the existing
+443 configuration; `nginx -t` checks the combined configuration before reload.
+The application site serves HTTPS only; this procedure does not open port 80. If
+HTTP-to-HTTPS redirection is desired, arrange it separately.
 
 Keep the supplied WebSocket `Upgrade`/`Connection` headers, forwarded scheme,
 disabled proxy buffering, and long read timeout. They are required for the live UI.
@@ -187,24 +212,27 @@ sudo systemctl reload nginx.service
 sudo systemctl --no-pager --full status cisco-dc-automation.service nginx.service
 sudo ss -ltnp
 curl --fail --silent --show-error -o /dev/null -w 'Backend HTTP %{http_code}\n' http://127.0.0.1:8088/login
-curl --fail --silent --show-error -o /dev/null -w 'HTTPS %{http_code}\n' "https://${APP_FQDN}/login"
+curl --fail --silent --show-error -o /dev/null -w 'HTTPS %{http_code}\n' "https://${APP_FQDN}:${APP_PORT}/login"
 ```
 
-Confirm **8088 binds only to 127.0.0.1** and Nginx listens on 443. Backend HTTP is
+Confirm **8088 binds only to 127.0.0.1** and Nginx still listens on both the
+existing 443 and selected application port. Test
+`https://${APP_FQDN}:${APP_PORT}/` and the existing Semaphore URL after the reload.
+Backend HTTP is
 only a local health check: the production service enables `--secure-cookies`, so
-sign in through `https://<server-dns-name>/`, never through backend HTTP.
+sign in through the configured HTTPS URL, never through backend HTTP.
 For a temporary certificate, use `curl --cacert` with the verified certificate
 rather than `-k`. Test that the WebSocket connection remains established.
 
 ## 8. Restrict Firewall Access
 
-Use the customer's firewall/change policy. Permit HTTPS 443 from approved
-administrator networks and retain approved SSH management access. Do not expose
-8088. If UFW is the approved host firewall, example rules are:
+Use the customer's firewall/change policy. Permit the selected HTTPS `APP_PORT`
+from approved administrator networks and retain approved SSH management access.
+Do not expose 8088. If UFW is the approved host firewall, example rules are:
 
 ```bash
 sudo ufw allow from 192.0.2.0/24 to any port 22 proto tcp
-sudo ufw allow from 192.0.2.0/24 to any port 443 proto tcp
+sudo ufw allow from 192.0.2.0/24 to any port "$APP_PORT" proto tcp
 sudo ufw status verbose
 ```
 
@@ -215,7 +243,8 @@ globally to troubleshoot an application issue.
 
 ## 9. Customer Acceptance Checks
 
-- Sign in through trusted HTTPS and create/review users and administrator roles.
+- Sign in through `https://${APP_FQDN}:${APP_PORT}/` using trusted HTTPS and
+  create/review users and administrator roles.
 - **APICs:** save Shared APIC Login domain/username/password, the switch DNS Domain,
   and APIC profiles. Use overrides only when a server requires a different account.
 - **Nexus Dashboards:** save Shared ND Login domain/API account and the separate
