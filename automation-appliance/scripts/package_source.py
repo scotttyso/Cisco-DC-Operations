@@ -13,7 +13,7 @@ SOURCE_FILES = (
     "aci_leaf_ifstatus_post.py", "aci_checks.py", "aci_jump.py", "secure_profiles.py", "nxos_jobs.py",
     "automation_ui.py", "nd_interfaces.py", "interface_description_table.py", "interface_description_table.js",
     "nxos-scripts/nd_stage_nexus_updates.py",
-    "nxos-scripts/nxos_bootflash_stage.py", "automation-appliance/install.sh",
+    "nxos-scripts/nxos_bootflash_stage.py", "automation-appliance/install.sh", "automation-appliance/update.py",
     "automation-appliance/cisco-dc-automation.service", "automation-appliance/nginx-cisco-dc.conf",
     "automation-appliance/files/cisco-dc-config.py", "automation-appliance/files/cisco-dc-firstboot.service",
 )

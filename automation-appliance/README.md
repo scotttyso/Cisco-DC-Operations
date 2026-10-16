@@ -163,7 +163,12 @@ deployment types use HTTPS on port 443, with the application backend accessible
 only on loopback. The Rocky Packer VM already uses this arrangement.
 
 For versioned releases, use the admin WebUI to check release notes and obtain
-checksum-verified CLI install instructions; the WebUI service does not have sudo.
+the administrator updater command; the WebUI service does not have sudo.
+The installer installs `/usr/local/sbin/cisco-dc-update`, which accepts
+`--version vX.Y.Z` or `--archive /path/to/source.tar.gz` with a SHA-256 checksum.
+It backs up code/state/key and validates service readiness. Follow the
+[update procedure](../docs/deploy_ubuntu_baremetal.md#updating-and-rolling-back)
+for maintenance prerequisites, bootstrap on older releases, and recovery.
 See [Releases and Updates](../docs/releasing.md).
 
 On a dedicated Linux VM with Python 3.10+, OpenSSH clients, and package access,

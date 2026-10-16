@@ -48,23 +48,9 @@ def latest_release(timeout: float = 10.0) -> dict:
 def install_instructions(tag: str) -> str:
     if not TAG_PATTERN.fullmatch(tag):
         raise ValueError("Invalid release version")
-    archive = f"cisco-dc-operations-{tag}.tar.gz"
-    release_url = f"https://github.com/{REPOSITORY}/releases/download/{tag}"
-    return f'''# Finish active jobs and back up application data and the vault key separately first.
+    return f'''# Finish ALL active jobs and use a trusted published release.
 # Run these commands on the application server from a normal admin shell.
-set -euo pipefail
-RELEASE_TAG={tag}
-ARCHIVE={archive}
-BASE_URL={release_url}
-WORK_DIR="$HOME/cisco-dc-operations-updates/$RELEASE_TAG"
-mkdir -p "$WORK_DIR/source"
-cd "$WORK_DIR"
-curl --fail --location --output "$ARCHIVE" "$BASE_URL/$ARCHIVE"
-curl --fail --location --output "$ARCHIVE.sha256" "$BASE_URL/$ARCHIVE.sha256"
-sha256sum --check "$ARCHIVE.sha256"
-tar -xzf "$ARCHIVE" -C source
-sudo systemctl stop cisco-dc-automation.service
-sudo bash "$WORK_DIR/source/automation-appliance/install.sh"
-sudo systemctl start cisco-dc-automation.service
-sudo systemctl --no-pager --full status cisco-dc-automation.service
+# The updater verifies SHA-256, confirms the outage, backs up code/state/key,
+# runs install.sh, and validates the service. Failures leave it stopped.
+sudo /usr/local/sbin/cisco-dc-update --version {tag}
 '''

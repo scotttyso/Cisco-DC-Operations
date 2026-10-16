@@ -36,7 +36,8 @@ administrator WebUI update-check/CLI-install workflow.
 
 For existing bare-metal installations, follow
 [Updating and Rolling Back](docs/deploy_ubuntu_baremetal.md#updating-and-rolling-back)
-for source-bundle downloads, backups, installation, and validation.
+for the `cisco-dc-update` administrator script, bootstrap on older releases,
+source-bundle downloads, backups, installation, and validation.
 
 ### Navigation
 

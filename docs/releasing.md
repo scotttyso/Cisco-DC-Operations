@@ -29,17 +29,25 @@ workflow succeeds and the release contains both
 
 An administrator can open **Account settings → Check for software updates** to
 check the latest public GitHub release and read its release notes. If a newer
-version is available, the dialog provides the exact CLI install commands and
-checksum verification. This is deliberately not an in-app code installer: the
+version is available, the dialog provides a version-specific
+`sudo /usr/local/sbin/cisco-dc-update --version vX.Y.Z` command. The updater
+downloads and verifies the archive/checksum, confirms the outage, backs up
+code/state/key, installs, and checks service readiness. This is deliberately not an in-app code installer: the
 WebUI service has no sudo access and cannot write the root-owned application.
 
 On the server, an administrator should finish active jobs, back up application
-state and the vault key separately, then run the displayed commands from a
-normal administrative shell. The commands verify the release archive checksum,
-stop the service, run the existing root-owned installer, and start the service.
+state and the vault key separately under their backup policy, then run the
+displayed command from a normal administrative shell. The updater creates
+additional local recovery archives before running the approved bundle's installer.
 Verify status and sign in again as required. The installer replaces application
 code/dependencies but leaves `/var/lib/cisco-dc-automation` and the vault key in
 place. Never run the image cleanup script during an application update.
+
+For offline bundles, the updater accepts `--archive` and an optional `--checksum`.
+See [Updating and Rolling Back](deploy_ubuntu_baremetal.md#updating-and-rolling-back)
+for the full workflow, failure handling, and one-time bootstrap on v0.1.1 or older.
+Those releases do not contain the updater; obtain it from an approved updated
+checkout or newer bundle first.
 
 The update checker reads only public GitHub release metadata; no GitHub token is
 stored on the customer server. Published source archives exclude runtime profiles,

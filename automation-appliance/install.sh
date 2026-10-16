@@ -30,6 +30,8 @@ done
 install -m 0644 "${PROJECT_DIR}/VERSION" "${APP_DIR}/"
 install -m 0644 "${PROJECT_DIR}/interface_description_table.js" "${APP_DIR}/"
 install -m 0644 "${PROJECT_DIR}/requirements.txt" "${APP_DIR}/"
+install -d -m 0755 /usr/local/sbin
+install -m 0755 "${PROJECT_DIR}/automation-appliance/update.py" /usr/local/sbin/cisco-dc-update
 install -m 0644 "${SCRIPTS_DIR}/nd_stage_nexus_updates.py" "${SCRIPTS_DIR}/nxos_bootflash_stage.py" "${APP_DIR}/nxos-scripts/"
 python3 -m venv "${APP_DIR}/.venv"
 "${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"

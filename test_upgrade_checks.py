@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import inspect
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -365,6 +366,7 @@ assert arguments.nd_url == 'https://nd.example.com'
                 names = archive.getnames()
                 self.assertEqual(set(names), set(packaging.SOURCE_FILES))
                 self.assertIn("nxos-scripts/nd_stage_nexus_updates.py", names)
+                self.assertIn("automation-appliance/update.py", names)
                 self.assertTrue({"oidc_auth.py", "release_updates.py", "VERSION"}.issubset(names))
                 self.assertFalse(any(".venv" in name or "vault.key" in name or ".pkrvars" in name for name in names))
 
@@ -401,6 +403,285 @@ assert arguments.nd_url == 'https://nd.example.com'
             configuration.set_ui_admin(build, "operator", "synthetic-password")
         self.assertNotIn("synthetic-password", " ".join(run.call_args.args))
         self.assertEqual(run.call_args.kwargs["input"], "operator\nsynthetic-password")
+
+
+class UpdaterTests(unittest.TestCase):
+    def setUp(self):
+        self.updater = appliance_module("dc_updater", "update.py")
+
+    def test_bundled_source_extracts_and_checksums_are_verified(self):
+        packaging = appliance_module("dc_package_update", "scripts/package_source.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.tar.gz"
+            packaging.package_source(archive)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            checksum = root / "source.tar.gz.sha256"
+            checksum.write_text(f"{digest}  {archive.name}\n")
+            self.updater.verify_checksum(archive, checksum)
+            version = (Path(__file__).parent / "VERSION").read_text().strip()
+            self.assertEqual(self.updater.extract_source(archive, root / "source", version), version)
+            self.assertEqual((root / "source/automation-appliance/install.sh").stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                self.updater.extract_source(archive, root / "wrong-version", "v999.0.0")
+            for text in (f"{'0' * 64}  {archive.name}\n", f"{digest}  ../other.tar.gz\n",
+                         f"{digest}  {archive.name}\n{digest}  {archive.name}\n", "bad\n"):
+                checksum.write_text(text)
+                with self.subTest(text=text), self.assertRaises(ValueError):
+                    self.updater.verify_checksum(archive, checksum)
+
+    def test_unsafe_archives_are_rejected_before_extraction(self):
+        members = []
+        for name in ("../escape", "/tmp/escape", "folder/../../escape", "folder\\escape"):
+            members.append(tarfile.TarInfo(name))
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.CHRTYPE, tarfile.FIFOTYPE):
+            member = tarfile.TarInfo("unsafe")
+            member.type = kind
+            member.linkname = "/etc/passwd"
+            members.append(member)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, member in enumerate(members):
+                archive = root / f"unsafe-{index}.tar.gz"
+                with tarfile.open(archive, "w:gz") as bundle:
+                    bundle.addfile(member)
+                target = root / f"source-{index}"
+                with self.subTest(name=member.name, kind=member.type), self.assertRaises(ValueError):
+                    self.updater.extract_source(archive, target, None)
+                self.assertFalse(target.exists())
+            for entries in (["duplicate", "duplicate"], ["VERSION"]):
+                archive = root / "incomplete.tar.gz"
+                with tarfile.open(archive, "w:gz") as bundle:
+                    for name in entries:
+                        bundle.addfile(tarfile.TarInfo(name))
+                with self.assertRaises(ValueError):
+                    self.updater.extract_source(archive, root / "invalid", None)
+
+    def test_local_bundle_is_copied_and_verified_without_network(self):
+        packaging = appliance_module("dc_package_local_update", "scripts/package_source.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "source.tar.gz"
+            packaging.package_source(archive)
+            checksum = root / "approved.sha256"
+            checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+            work = root / "work"
+            work.mkdir()
+            args = self.updater.parse_args(["--archive", str(archive), "--checksum", str(checksum)])
+            with patch.object(self.updater, "run") as run:
+                source, version = self.updater.prepare_source(args, work)
+            run.assert_not_called()
+            self.assertEqual(source, work / "source")
+            self.assertEqual(version, (Path(__file__).parent / "VERSION").read_text().strip())
+
+    def test_downloads_are_versioned_https_and_verified_before_extraction(self):
+        args = self.updater.parse_args(["--version", "v1.2.3"])
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(self.updater, "run") as run, \
+                patch.object(self.updater, "verify_checksum") as verify, \
+                patch.object(self.updater, "extract_source", return_value="v1.2.3") as extract:
+            self.updater.prepare_source(args, Path(directory))
+            self.assertEqual(run.call_count, 2)
+            for call in run.call_args_list:
+                self.assertIn("--fail", call.args)
+                self.assertIn("--proto-redir", call.args)
+                self.assertIn("=https", call.args)
+                self.assertTrue(call.args[-1].startswith(
+                    "https://github.com/scotttyso/Cisco-DC-Operations/releases/download/v1.2.3/"))
+            verify.assert_called_once()
+            extract.assert_called_once()
+        with patch.object(self.updater, "run"), \
+                patch.object(self.updater, "verify_checksum", side_effect=ValueError("bad checksum")), \
+                patch.object(self.updater, "extract_source") as extract:
+            with self.assertRaisesRegex(ValueError, "bad checksum"):
+                self.updater.prepare_source(args, Path("/unused"))
+            extract.assert_not_called()
+
+    def test_success_orders_stop_backups_install_validation_and_start(self):
+        events = []
+        with patch.object(self.updater, "run", side_effect=lambda *args, **kwargs: events.append(args)), \
+                patch.object(self.updater, "make_backups", side_effect=lambda path: events.append(("backup",))), \
+                patch.object(self.updater, "wait_ready", side_effect=lambda: events.append(("health",))):
+            self.updater.install_update(Path("/source"), Path("/backups"))
+        self.assertEqual(events[0], ("systemctl", "stop", self.updater.SERVICE))
+        self.assertEqual(events[1], ("backup",))
+        self.assertEqual(events[2], ("bash", "/source/automation-appliance/install.sh"))
+        self.assertIn("-m", events[3])
+        self.assertIn("check", events[3])
+        self.assertEqual(events[-2], ("systemctl", "start", self.updater.SERVICE))
+        self.assertEqual(events[-1], ("health",))
+
+    def test_failures_leave_service_stopped_without_automatic_rollback(self):
+        for stage in ("backup", "install", "import", "health"):
+            with self.subTest(stage=stage):
+                events = []
+
+                def run(*args, **kwargs):
+                    events.append(args)
+                    if ((stage == "install" and args[0] == "bash")
+                            or (stage == "import" and "-c" in args)):
+                        raise subprocess.CalledProcessError(1, args)
+
+                with patch.object(self.updater, "run", side_effect=run), \
+                        patch.object(self.updater, "make_backups",
+                                     side_effect=RuntimeError("backup failed") if stage == "backup" else None), \
+                        patch.object(self.updater, "wait_ready",
+                                     side_effect=RuntimeError("health failed") if stage == "health" else None):
+                    with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                        self.updater.install_update(Path("/source"), Path("/backups"))
+                self.assertEqual(events[-1], ("systemctl", "stop", self.updater.SERVICE))
+                if stage == "backup":
+                    self.assertFalse(any(args[0] == "bash" for args in events))
+                self.assertFalse(any("restore" in " ".join(args) for args in events))
+
+    def test_health_requires_active_service_and_http_200(self):
+        response = MagicMock(status=200)
+        response.geturl.return_value = "http://127.0.0.1:8088/login"
+        with patch.object(self.updater, "run") as run, \
+                patch.object(self.updater, "build_opener") as build:
+            request = build.return_value.open
+            request.return_value.__enter__.return_value = response
+            self.updater.wait_ready()
+            run.assert_called_once_with("systemctl", "is-active", "--quiet", self.updater.SERVICE)
+            request.assert_called_once_with("http://127.0.0.1:8088/login", timeout=3)
+            self.assertEqual(build.call_args.args[0].proxies, {})
+        with patch.object(self.updater, "run"), \
+                patch.object(self.updater, "build_opener") as build, \
+                patch.object(self.updater.time, "sleep"), \
+                patch.object(self.updater.time, "monotonic", side_effect=[0, 0, 61]):
+            build.return_value.open.side_effect = OSError("connection refused")
+            with self.assertRaisesRegex(RuntimeError, "connection refused"):
+                self.updater.wait_ready()
+
+    def test_requires_explicit_source_and_root(self):
+        for args in ([], ["--version", "main"], ["--version", "v1.2.3", "--archive", "a"],
+                     ["--version", "v1.2.3", "--checksum", "a"]):
+            with self.subTest(args=args), patch("sys.stderr"), self.assertRaises(SystemExit):
+                self.updater.parse_args(args)
+        with patch.object(self.updater.os, "geteuid", return_value=1000), \
+                patch.object(self.updater, "preflight") as preflight:
+            self.assertEqual(self.updater.main(["--version", "v1.2.3"]), 1)
+            preflight.assert_not_called()
+
+    def test_preflight_rejects_custom_state_key_and_backend_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("app", "state", "key"):
+                (root / name).mkdir()
+            (root / "key/vault.key").write_text("synthetic")
+            env = root / "service.env"
+            environment = {}
+
+            def show(*args, **kwargs):
+                if "--property=Environment" in args:
+                    return environment.get("environment", "")
+                if "--property=EnvironmentFiles" in args:
+                    return environment.get("files", "")
+                if "--property=WorkingDirectory" in args:
+                    return str(root / "app")
+                if "--property=ExecStart" in args:
+                    return environment.get("command",
+                        f"{{ argv[]={root}/app/.venv/bin/python {root}/app/automation_ui.py "
+                        "--host 127.0.0.1 --port 8088 ; }")
+                self.fail(f"Unexpected command: {args}")
+
+            with patch.object(self.updater, "APP", root / "app"), \
+                    patch.object(self.updater, "STATE", root / "state"), \
+                    patch.object(self.updater, "KEY", root / "key"), \
+                    patch.object(self.updater, "ENV_FILE", env), \
+                    patch.object(self.updater, "run", side_effect=show):
+                self.updater.preflight()
+                for name in ("DC_AUTOMATION_DATA", "DC_AUTOMATION_KEY_FILE", "DC_NXOS_SCRIPTS_DIR"):
+                    environment["environment"] = f"{name}=/custom"
+                    with self.subTest(name=name), self.assertRaisesRegex(ValueError, "Custom"):
+                        self.updater.preflight()
+                environment.clear()
+                env.write_text("DC_AUTOMATION_DATA=/custom\n")
+                with self.assertRaisesRegex(ValueError, "Custom"):
+                    self.updater.preflight()
+                env.unlink()
+                environment["files"] = "/custom.env (ignore_errors=no)"
+                with self.assertRaisesRegex(ValueError, "EnvironmentFiles"):
+                    self.updater.preflight()
+                environment.clear()
+                environment["command"] = f"{root}/app/automation_ui.py --host 0.0.0.0 --port 9999"
+                with self.assertRaisesRegex(ValueError, "standard backend"):
+                    self.updater.preflight()
+
+    def test_backup_failure_for_insufficient_space_precedes_any_archive_write(self):
+        with patch.object(self.updater, "run", return_value="1000 /path") as run, \
+                patch.object(self.updater.shutil, "disk_usage",
+                             return_value=SimpleNamespace(free=1000)):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient"):
+                self.updater.make_backups(Path("/backups"))
+            self.assertTrue(all(call.args[0] == "du" for call in run.call_args_list))
+
+    def test_backups_preserve_code_state_and_key_in_separate_private_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("app", "state", "key", "backups"):
+                (root / name).mkdir()
+            for name in ("app", "state", "key"):
+                (root / name / "fixture").write_text(f"synthetic-{name}")
+            (root / "app/python-link").symlink_to("/usr/bin/python3")
+            with patch.object(self.updater, "APP", root / "app"), \
+                    patch.object(self.updater, "STATE", root / "state"), \
+                    patch.object(self.updater, "KEY", root / "key"), \
+                    patch.object(Path, "exists", return_value=False):
+                self.updater.make_backups(root / "backups")
+            for filename, folder in (("application", "app"), ("state", "state"), ("vault-key", "key")):
+                path = root / f"backups/{filename}.tar.gz"
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                with tarfile.open(path) as archive:
+                    self.assertEqual(archive.extractfile(f"{folder}/fixture").read(),
+                                     f"synthetic-{folder}".encode())
+                    if folder == "app":
+                        self.assertTrue(archive.getmember("app/python-link").issym())
+
+    def test_main_requires_confirmation_and_preserves_recovery_directory(self):
+        real_open = os.open
+        real_stat = os.fstat
+        real_mkdtemp = tempfile.mkdtemp
+        for answer in ("cancel", "UPDATE"):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "VERSION").write_text("v0.1.0")
+                lock_fd = None
+
+                def open_file(path, *args, **kwargs):
+                    nonlocal lock_fd
+                    if path == "/run/lock/cisco-dc-update.lock":
+                        lock_fd = real_open(root / "lock", *args, **kwargs)
+                        return lock_fd
+                    return real_open(path, *args, **kwargs)
+
+                def file_stat(fd):
+                    if fd == lock_fd:
+                        return SimpleNamespace(st_uid=0, st_mode=0o100600)
+                    return real_stat(fd)
+
+                def temporary_directory(suffix=None, prefix=None, dir=None):
+                    return real_mkdtemp(suffix=suffix, prefix=prefix, dir=root)
+
+                with patch.object(self.updater, "APP", root), \
+                        patch.object(self.updater.os, "geteuid", return_value=0), \
+                        patch.object(self.updater.os, "umask"), \
+                        patch.object(self.updater.os, "open", side_effect=open_file), \
+                        patch.object(self.updater.os, "fstat", side_effect=file_stat), \
+                        patch.object(self.updater.tempfile, "mkdtemp", side_effect=temporary_directory), \
+                        patch.dict(os.environ), \
+                        patch.object(self.updater, "preflight") as preflight, \
+                        patch.object(self.updater, "prepare_source", return_value=(root / "source", "v0.1.1")), \
+                        patch.object(self.updater, "install_update") as install, \
+                        patch("builtins.input", return_value=answer):
+                    self.assertEqual(self.updater.main(["--version", "v0.1.1"]), 0)
+                    preflight.assert_called_once()
+                    if answer == "UPDATE":
+                        install.assert_called_once()
+                        self.assertTrue(install.call_args.args[1].is_dir())
+                        self.assertEqual(install.call_args.args[1].stat().st_mode & 0o777, 0o700)
+                    else:
+                        install.assert_not_called()
 
 
 class NXJobTests(unittest.TestCase):
@@ -1114,9 +1395,9 @@ class ProfileTests(unittest.TestCase):
                                    "assets": [{"name": archive}, {"name": archive + ".sha256"}]})
         commands = install_instructions(release["tag"])
         self.assertEqual(release["archive_name"], archive)
-        self.assertIn("sha256sum --check", commands)
-        self.assertIn("systemctl stop cisco-dc-automation.service", commands)
-        self.assertIn("install.sh", commands)
+        self.assertIn("sudo /usr/local/sbin/cisco-dc-update --version v1.2.3", commands)
+        self.assertNotIn("curl", commands)
+        self.assertNotIn("--yes", commands)
         with self.assertRaises(ValueError):
             release_details({"tag_name": "latest", "assets": []})
         with self.assertRaises(ValueError):

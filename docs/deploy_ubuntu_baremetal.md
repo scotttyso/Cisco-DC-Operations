@@ -298,6 +298,78 @@ state. Reset a lost WebUI password by rerunning step 4 for the existing username
 
 ## Updating and Rolling Back
 
+### Recommended: Administrator Updater
+
+New installations install `automation-appliance/update.py` as
+`/usr/local/sbin/cisco-dc-update`. Finish **all active jobs** and run it from an
+administrator shell, not from the WebUI:
+
+```bash
+# Replace v0.1.2 with an actual published release containing your desired changes.
+sudo /usr/local/sbin/cisco-dc-update --version v0.1.2
+```
+
+For an offline or locally packaged bundle, transfer the archive and its checksum
+through your approved channel, then run:
+
+```bash
+sudo /usr/local/sbin/cisco-dc-update \
+  --archive /path/to/cisco-dc-operations-source.tar.gz
+# By default the checksum is /path/to/cisco-dc-operations-source.tar.gz.sha256.
+# Use --checksum /path/to/approved.sha256 to select a different checksum file.
+```
+
+Only use trusted source: the updater runs the bundle's installer as root.
+SHA-256 detects corruption but does not authenticate a bundle and checksum
+obtained from an untrusted source. Releases are fetched over verified HTTPS.
+
+The updater:
+
+1. Prevents concurrent updater runs and checks for the standard installation,
+   data/key paths, and backend at `127.0.0.1:8088`. Custom deployments must use
+   the manual procedure below.
+2. Verifies the checksum, safely unpacks regular source files into a private
+   temporary directory, and checks required files and the requested version.
+3. Displays installed and target versions, then requires typing `UPDATE`.
+   `--yes` skips the prompt and explicitly confirms that jobs are finished
+   and the UI outage is approved; it does not skip validation.
+4. Stops the service, checks backup space, and creates private archives in a
+   new `/var/backups/cisco-dc-automation-update-*` directory: application
+   code/venv, state, vault key, and existing Nginx/application/systemd config
+   plus the installed updater. State and key are separate files.
+5. Runs the bundle's installer, `pip check`, an application import check, and
+   service startup. It waits up to 60 seconds for an active service and an
+   HTTP 200 from the loopback login endpoint.
+
+On failure after stopping the service, it attempts to keep the service stopped,
+returns a nonzero exit code, and reports the recovery directory. Backups may be
+incomplete if backup creation failed. **It never automatically rolls back a
+database or restores the vault key.** Review errors and the service journal
+before recovery. Downloads and temporary extraction files are cleaned up;
+backups are retained. It does not enforce an upgrade-only version order, so
+review the displayed versions before confirming a same-version reinstall or
+downgrade.
+
+Move the key backup to separate protected storage. Preserve TLS keys/certificates
+separately as well: their configured paths may be outside the configuration
+backup. The updater does not change Nginx/TLS configuration or regenerate
+accounts/keys. Complete the HTTPS/UI acceptance checks after it succeeds.
+
+**One-time bootstrap for v0.1.1 and earlier:** these releases do not install the
+updater. Obtain an approved copy of `automation-appliance/update.py` from the
+updated checkout or a checksum-verified newer source bundle. Run it directly:
+
+```bash
+sudo python3 /path/to/automation-appliance/update.py \
+  --archive /path/to/cisco-dc-operations-source.tar.gz
+```
+
+The new bundle's installer installs the `cisco-dc-update` command for subsequent
+updates. A new versioned release must be published to ship this script through
+GitHub release assets; previously published bundles are unchanged.
+
+### Manual Update and Recovery Reference
+
 You do **not** need to rebuild the server or appliance image. Download an
 application source bundle, extract it into a fresh staging directory, and rerun
 its installer while the application service is stopped. Do not extract directly
