@@ -43,27 +43,29 @@ STORE: ProfileStore
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap');
-:root {--ink:#253139;--muted:#5c6972;--line:#d4dce0;--paper:#fff;--workspace:#f3f5f6;--accent:#007e87;}
-.body--dark {--ink:#e5ecec;--muted:#a8b8b9;--line:#465253;--paper:#263032;--workspace:#1b2325;--accent:#65cdd1;}
+:root {--workspace:#f0f1f2;--surface:#fff;--border:#d0d4d9;--ink:#23282e;--muted:#656c75;
+ --accent:#0d5cbd;--subtle:#e3eeff;}
+.body--dark {--workspace:#0f1824;--surface:#151c24;--border:#2d3743;--ink:#e1e4e8;
+ --muted:#a7adb5;--accent:#33bbf5;--subtle:#172c40;}
 body {font-family:'Public Sans',sans-serif;letter-spacing:0;color:var(--ink);background:var(--workspace);}
 body.body--dark {background:var(--workspace);color:var(--ink);}
 .nicegui-content {padding:0;gap:0;}
-.topbar {background:#162d35;color:white;min-height:60px;}
+.topbar {background:linear-gradient(100deg,#283f66,#0d274d 60%,#091b33);color:white;min-height:60px;}
 .brand {font-size:19px;font-weight:600;line-height:1.2;}
 .workspace {width:100%;max-width:1560px;margin:auto;padding:24px 32px;min-width:0;}
 .heading {font-size:24px;font-weight:600;margin:0;line-height:1.3;}
 .section-title {font-size:17px;font-weight:600;}
 .muted {color:var(--muted);font-size:13px;}
-.workspace-tabs {width:100%;margin-top:20px;border-bottom:1px solid var(--line);}
+.workspace-tabs {width:100%;margin-top:20px;border-bottom:1px solid var(--border);}
 .q-tab {text-transform:none;letter-spacing:0;min-height:48px;}
 .q-tab-panel {padding:24px 0;}
 .q-tab-panels {background:transparent;width:100%;min-width:0;}
 .form-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;width:100%;align-items:start;}
 .q-btn {letter-spacing:0;text-transform:none;border-radius:4px;}
-.q-field__control {background:var(--paper);}
-.q-field--outlined .q-field__control:before {border-color:var(--line);}
-.section {width:100%;border-top:1px solid var(--line);padding-top:20px;margin-top:20px;min-width:0;}
-.q-table__container {width:100%;border:1px solid var(--line);box-shadow:none;border-radius:4px;background:var(--paper);color:var(--ink);}
+.q-field__control {background:var(--surface);}
+.q-field--outlined .q-field__control:before {border-color:var(--border);}
+.section {width:100%;border-top:1px solid var(--border);padding-top:20px;margin-top:20px;min-width:0;}
+.q-table__container {width:100%;border:1px solid var(--border);box-shadow:none;border-radius:4px;background:var(--surface);color:var(--ink);}
 .q-table {min-width:660px;}
 .q-table th {color:var(--muted);font-weight:600;}
 .q-table td {max-width:440px;white-space:normal;overflow-wrap:anywhere;}
@@ -71,14 +73,14 @@ body.body--dark {background:var(--workspace);color:var(--ink);}
 .q-toggle__label,.q-checkbox__label {font-size:13px;}
 .q-btn-toggle {box-shadow:none;max-width:100%;flex-wrap:wrap;}
 .q-btn-toggle .q-btn {min-height:40px;}
-.job-log {height:240px;width:100%;border:1px solid var(--line);background:#18272c;color:#d8eae8;border-radius:4px;font-size:12px;}
+.job-log {height:240px;width:100%;border:1px solid var(--border);background:#0f1824;color:#e1e4e8;border-radius:4px;font-size:12px;}
 .code-input textarea {font-family:monospace;font-size:13px;min-height:290px;}
 .login-wrap {min-height:80vh;width:100%;display:flex;align-items:center;justify-content:center;padding:24px;}
-.login-form {width:380px;max-width:100%;padding:28px;border:1px solid var(--line);border-radius:4px;background:var(--paper);}
-.q-card,.q-menu {background:var(--paper);color:var(--ink);}
-.metrics {display:flex;flex-wrap:wrap;gap:24px;width:100%;border-bottom:1px solid var(--line);padding-bottom:16px;}
+.login-form {width:380px;max-width:100%;padding:28px;border:1px solid var(--border);border-radius:4px;background:var(--surface);}
+.q-card,.q-menu {background:var(--surface);color:var(--ink);}
+.metrics {display:flex;flex-wrap:wrap;gap:24px;width:100%;border-bottom:1px solid var(--border);padding-bottom:16px;}
 .metric-value {font-size:26px;font-weight:600;line-height:1.3;}
-.summary-banner {width:100%;border-left:4px solid var(--accent);padding:10px 14px;background:var(--paper);}
+.summary-banner {width:100%;border-left:4px solid var(--accent);padding:10px 14px;background:var(--surface);}
 .filter-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:100%;}
 .dialog {width:640px;max-width:94vw;border-radius:4px;}
 .report-dialog {width:1100px;max-width:96vw;max-height:92vh;}
@@ -136,13 +138,13 @@ def notify_error(error, credentials=None):
 def theme_control(username=None):
     preference = STORE.user(username).get("theme", "light") if username else app.storage.user.get("theme", "light")
     dark = ui.dark_mode(preference == "dark")
-    ui.colors(primary="#65cdd1" if dark.value else "#007e87")
+    ui.colors(primary="#33bbf5" if dark.value else "#0d5cbd")
 
     def toggle():
         if username:
             STORE.set_theme(owner(), "light" if dark.value else "dark")
         dark.toggle()
-        ui.colors(primary="#65cdd1" if dark.value else "#007e87")
+        ui.colors(primary="#33bbf5" if dark.value else "#0d5cbd")
         app.storage.user["theme"] = "dark" if dark.value else "light"
         button.props(f"icon={'light_mode' if dark.value else 'dark_mode'}")
 
@@ -501,7 +503,7 @@ async def confirm(title: str, action: str) -> bool:
 
 @ui.page("/login")
 def login_page(request: Request):
-    ui.colors(primary="#007e87", positive="#307c47", negative="#bd3545", warning="#b47c0b")
+    ui.colors(primary="#0d5cbd", positive="#307c47", negative="#bd3545", warning="#b47c0b")
     with ui.header().classes("topbar"):
         with ui.row().classes("w-full items-center gap-3"):
             ui.icon("hub", size="26px")
@@ -1148,7 +1150,9 @@ def interface_description_panel():
     def filter_rows(reset_page=False):
         owner()
         try:
-            interfaces.rows = filter_interface_rows(state["rows"], search.value or "", regex=filter_mode.value == "regex")
+            interfaces.rows = filter_interface_rows(state["rows"], search.value or "",
+                                                   field=filter_field.value or "all",
+                                                   operator=filter_operator.value or "contains")
             filter_error.text = ""
         except ValueError as error:
             interfaces.rows = []
@@ -1435,8 +1439,14 @@ def interface_description_panel():
         status = ui.label("Not connected").classes("muted")
         with ui.row().classes("w-full items-center gap-3"):
             search = ui.input("Filter interfaces").props("outlined dense clearable").classes("flex-1").style("min-width:200px")
-            filter_mode = ui.toggle({"text": "Text", "regex": "Regex"}, value="text")
-            filter_mode.tooltip("Regex matches interface names; 1/1[4-5]$ matches Ethernet1/14 and Ethernet1/15")
+            filter_field = ui.select({"all": "Any column", "interface": "Interface", "proposed": "New description",
+                                      "description": "Current description", "policy": "Policy", "mode": "Mode",
+                                      "notice": "ND data note", "blocked_reason": "Unavailable reason",
+                                      "change": "Change"}, value="all", label="Column").props("outlined dense")
+            filter_operator = ui.select({"contains": "Contains", "not_contains": "Does not contain",
+                                         "regex": "Matches regex", "not_regex": "Does not match regex"},
+                                        value="contains", label="Match").props("outlined dense")
+            filter_operator.tooltip("Text and regex matching use the selected column.")
         filter_error = ui.label().classes("text-negative")
         visible_count = ui.label("0 interfaces").classes("muted")
         interfaces = InterfaceDescriptionTable(columns=[{"name": key, "label": label, "field": key, "align": "left", "sortable": True}
@@ -1450,7 +1460,8 @@ def interface_description_panel():
         interfaces.on("select_available", lambda event: select_available(bool(event.args.get("clear"))))
         interfaces.on("description_edit", edit_interface)
         search.on_value_change(lambda: filter_rows(True))
-        filter_mode.on_value_change(lambda: filter_rows(True))
+        filter_field.on_value_change(lambda: filter_rows(True))
+        filter_operator.on_value_change(lambda: filter_rows(True))
         queued = ui.label("0 edited interfaces | 0 selected for preview").classes("muted")
         with ui.row():
             preview_button = ui.button("Preview changes", icon="preview", on_click=preview).props("outline")
@@ -1461,7 +1472,8 @@ def interface_description_panel():
                                          for key, label in (("interface", "Interface"), ("old", "Previous description"),
                                                             ("new", "New description"), ("state", "Result"), ("detail", "Detail"))],
                                 rows=[], row_key="interface", pagination=15).classes("w-full")
-    controls = (dashboard, fabric, switch, search, filter_mode, connect_button, load_button, preview_button, apply_button)
+    controls = (dashboard, fabric, switch, search, filter_field, filter_operator,
+                connect_button, load_button, preview_button, apply_button)
     dashboard.on_value_change(dashboard_changed)
     fabric.on_value_change(fabric_changed)
     switch.on_value_change(clear_interfaces)
@@ -1581,7 +1593,7 @@ def dashboard_management(dashboard_selector, on_change):
 
 @ui.page("/")
 def workspace():
-    ui.colors(primary="#007e87", positive="#307c47", negative="#bd3545", warning="#b47c0b")
+    ui.colors(primary="#0d5cbd", positive="#307c47", negative="#bd3545", warning="#b47c0b")
     try:
         username = owner()
     except ValueError:

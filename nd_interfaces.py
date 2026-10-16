@@ -33,17 +33,33 @@ def validate_description(description: str) -> str:
     return description
 
 
-def filter_interface_rows(rows: list[dict], pattern: str = "", regex: bool = False) -> list[dict]:
+def filter_interface_rows(rows: list[dict], pattern: str = "", regex: bool = False,
+                          field: str = "all", operator: str | None = None) -> list[dict]:
+    operator = operator or ("regex" if regex else "contains")
+    if operator not in {"contains", "not_contains", "regex", "not_regex"}:
+        raise ValueError("Unsupported interface filter operator")
+    if field != "all" and any(field not in row for row in rows):
+        raise ValueError("Unsupported interface filter column")
     if not pattern:
         return list(rows)
-    if regex:
+    if operator in {"regex", "not_regex"}:
         try:
             expression = re.compile(pattern, re.IGNORECASE)
         except re.error as error:
             raise ValueError(f"Invalid interface regex: {error}") from None
-        return [row for row in rows if expression.search(row["interface"])]
+
+        def regex_matches(row: dict) -> bool:
+            values = row.values() if field == "all" else (row[field],)
+            return any(expression.search(str(value)) for value in values)
+
+        return [row for row in rows if regex_matches(row) == (operator == "regex")]
     query = pattern.strip().casefold()
-    return [row for row in rows if query in " ".join(str(value) for value in row.values()).casefold()]
+
+    def text_matches(row: dict) -> bool:
+        values = row.values() if field == "all" else (row[field],)
+        return any(query in str(value).casefold() for value in values)
+
+    return [row for row in rows if text_matches(row) == (operator == "contains")]
 
 
 def interface_records(payload) -> list[dict]:

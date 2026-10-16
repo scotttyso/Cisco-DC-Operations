@@ -168,6 +168,24 @@ class InterfaceDescriptionTests(unittest.TestCase):
             filter_interface_rows(rows, "1/[", regex=True)
         self.assertEqual(len(rows), 5)
 
+    def test_column_filter_supports_mode_text_and_regex_matches(self):
+        rows = [
+            {"interface": "Ethernet1/1", "mode": "trunk"},
+            {"interface": "Ethernet1/2", "mode": "unknown"},
+            {"interface": "Ethernet1/3", "mode": ""},
+            {"interface": "Ethernet1/4", "mode": "Multiple values; preview required"},
+        ]
+        self.assertEqual([row["interface"] for row in filter_interface_rows(rows, "TRUNK", field="mode")],
+                         ["Ethernet1/1"])
+        self.assertEqual([row["interface"] for row in filter_interface_rows(rows, "^tr", field="mode", operator="regex")],
+                         ["Ethernet1/1"])
+        self.assertEqual([row["interface"] for row in filter_interface_rows(rows, "^tr", field="mode", operator="not_regex")],
+                         ["Ethernet1/2", "Ethernet1/3", "Ethernet1/4"])
+        self.assertEqual([row["interface"] for row in filter_interface_rows(rows, "unknown", field="mode", operator="regex")],
+                         ["Ethernet1/2"])
+        self.assertEqual([row["interface"] for row in filter_interface_rows(rows, "unknown", field="mode", operator="not_regex")],
+                         ["Ethernet1/1", "Ethernet1/3", "Ethernet1/4"])
+
     def setUp(self):
         self.original = {"interfaceName": "Ethernet1/15/1", "interfaceType": "ethernet", "switchId": "SERIAL1",
                          "configData": {"mode": "trunk", "networkOS": {"networkOSType": "nx-os", "policy": {
