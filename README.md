@@ -261,6 +261,26 @@ must be uploaded to ND. Invalid YAML or malformed/empty rules block the job
 before launching a process. Standalone CLI configs can also include
 `upgrade_rules`; omitting the section preserves the original defaults.
 
+The **Image mappings YAML** editor optionally pins each target version to an
+exact uploaded ND filename. Edits are retained in your browser session and
+included in both plan and apply jobs. For example:
+
+```yaml
+image_mappings:
+  "9.3.16": nxos.9.3.16.bin
+  "10.3.10": nxos64-cs.10.3.10.M.bin
+  "10.6.4": nxos64-cs.10.6.4.M.bin
+```
+
+Use `image_mappings: {}` for automatic selection, or list only the targets
+requiring explicit selection. Mapping keys must exactly match the rule's
+target version; filenames are case-sensitive. Both **Present** and **Verified**
+images are eligible. A mapping disambiguates filenames but never bypasses
+release/platform/subtype/availability checks: missing, incompatible, or
+unavailable mapped images stop the job. Without a mapping, ambiguous matches
+still stop execution. Errors list matching-release catalog entries and statuses.
+Standalone CLI configs accept the same optional `image_mappings` section.
+
 Named mode generates `update_groups` rather than `switches.hosts`; inactive-mode
 fields are ignored. Names must be unique and contain 1-48 letters, digits,
 underscores, or hyphens. Empty groups and repeated switch selectors across groups

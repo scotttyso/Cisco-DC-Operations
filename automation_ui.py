@@ -910,6 +910,17 @@ def nd_upgrade_rules_yaml(text: str) -> dict:
     return document
 
 
+def nd_image_mappings_yaml(text: str) -> dict:
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise ValueError("Invalid image mappings YAML") from None
+    if not isinstance(document, dict) or set(document) != {"image_mappings"}:
+        raise ValueError("Image mappings YAML requires only an image_mappings mapping")
+    nd_helpers()["load_image_mappings"](document["image_mappings"])
+    return document
+
+
 def nxos_panel(kind: str):
     job = None
     group_fields = []
@@ -951,6 +962,17 @@ def nxos_panel(kind: str):
             rules_input.bind_value(app.storage.user, "nd_upgrade_rules_yaml")
             ui.label("These rules replace all defaults. First match wins; N9K devices only. "
                      "Quote versions and verify supported upgrade paths before staging.").classes("muted")
+            app.storage.user.setdefault("nd_image_mappings_yaml",
+                                        'image_mappings: {}\n'
+                                        '# Optional exact filename overrides, for example:\n'
+                                        '# image_mappings:\n'
+                                        '#   "9.3.16": nxos.9.3.16.bin\n'
+                                        '#   "10.3.10": nxos64-cs.10.3.10.M.bin\n'
+                                        '#   "10.6.4": nxos64-cs.10.6.4.M.bin\n')
+            images_input = ui.textarea("Image mappings YAML").props("outlined autogrow").classes("w-full code-input")
+            images_input.bind_value(app.storage.user, "nd_image_mappings_yaml")
+            ui.label("Map target versions to exact ND image filenames. Empty mapping uses automatic selection. "
+                     "Mapped images must match the release and be Present or Verified N9K NX-OS images.").classes("muted")
             pre_report = ui.checkbox("Request pre-update report before staging", value=False)
         else:
             config_input = ui.textarea("Bootflash YAML configuration", value=BOOTFLASH_EXAMPLE).props("outlined").classes("w-full code-input")
@@ -975,6 +997,7 @@ def nxos_panel(kind: str):
                                                  for group in group_fields]) if kind == "nd" else None
                 if kind == "nd":
                     selection.update(nd_upgrade_rules_yaml(rules_input.value or ""))
+                    selection.update(nd_image_mappings_yaml(images_input.value or ""))
                 if apply.value and not await confirm(
                     (f"Create/reuse {len(selection['update_groups'])} named ND update group(s) and stage images?"
                      if "update_groups" in selection else "Create per-switch ND update groups and stage images?") if kind == "nd"

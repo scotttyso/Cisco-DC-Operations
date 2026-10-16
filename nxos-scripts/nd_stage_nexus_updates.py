@@ -205,23 +205,31 @@ def version_key(value: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", value))
 
 
-def select_image(payload: Any, switch: Switch, target: str) -> str:
+def select_image(payload: Any, switch: Switch, target: str, image_name_override: Optional[str] = None) -> str:
     candidates = []
+    matching_release = []
     for item in walk_records(payload):
         image_name = field(item, "imageName")
         if not image_name:
             continue
         image_version = field(item, "releaseVersion", "imageVersion")
         if not image_version:
-            image_version = image_name
+            match = re.search(r"\.(\d+(?:[.(]\d+\)?)+)", image_name)
+            image_version = match[1] if match else ""
         platform = field(item, "platform").casefold()
         present = field(item, "imagePresent").casefold()
         image_subtype = field(item, "imageSubType").casefold()
         if version_key(image_version) != version_key(target):
             continue
+        matching_release.append(
+            f"{image_name} (platform={platform or 'unspecified'}, "
+            f"status={present or 'unspecified'}, subtype={image_subtype or 'unspecified'})"
+        )
+        if image_name_override is not None and image_name != image_name_override:
+            continue
         if platform and platform not in {"n9k", "nexus 9000"}:
             continue
-        if present and present != "present":
+        if present and present not in {"present", "verified"}:
             continue
         if image_subtype and image_subtype not in {"nx-os", "nxos"}:
             continue
@@ -232,7 +240,10 @@ def select_image(payload: Any, switch: Switch, target: str) -> str:
         found = ", ".join(candidates) if candidates else "none"
         raise ValueError(
             f"Expected one uploaded N9K image for {target} on {switch.name}; found {found}. "
-            "Upload the target image to ND and remove any ambiguous duplicate."
+            f"Requested image: {image_name_override or 'automatic selection'}. "
+            f"Catalog entries for this release: {'; '.join(sorted(set(matching_release))) or 'none'}. "
+            "Upload a Present/Verified NX-OS image to ND or set image_mappings "
+            "to select one eligible filename."
         )
     return candidates[0]
 
@@ -401,6 +412,7 @@ def device_group_name(switch: Switch) -> str:
 def make_plan(
     group_name: str, members: Sequence[Switch], checks: Sequence[Dict[str, Any]], images: Any,
     upgrade_rules: Sequence[UpgradeRule] = DEFAULT_UPGRADE_RULES,
+    image_mappings: Optional[Dict[str, str]] = None,
 ) -> Optional[Plan]:
     targets = [target_for(switch, upgrade_rules) for switch in members]
     if not any(targets):
@@ -412,7 +424,8 @@ def make_plan(
     if len(fabrics) != 1:
         raise ValueError(f"Update group {group_name} spans fabrics: {', '.join(fabrics)}")
     images_by_switch = {
-        switch.name: select_image(images, switch, target) for switch, target in zip(members, targets)
+        switch.name: select_image(images, switch, target, (image_mappings or {}).get(target))
+        for switch, target in zip(members, targets)
     }
     if len(set(images_by_switch.values())) != 1:
         detail = ", ".join(f"{name}={image}" for name, image in images_by_switch.items())
@@ -541,6 +554,17 @@ def apply_plan(
     )
 
 
+def load_image_mappings(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        raise ValueError("image_mappings must be a mapping of quoted target versions to image filenames")
+    for version, name in raw.items():
+        if not isinstance(version, str) or not re.fullmatch(r"\d+(?:\.\d+)+", version):
+            raise ValueError("image_mappings keys must be quoted dotted target versions, e.g. '9.3.16'")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.()-]*\.bin", name):
+            raise ValueError(f"image_mappings[{version!r}] must be an exact .bin filename, not a path")
+    return dict(raw)
+
+
 def load_upgrade_rules(raw: Any) -> Tuple[UpgradeRule, ...]:
     if not isinstance(raw, list) or not raw:
         raise ValueError("upgrade_rules must be a nonempty list")
@@ -568,6 +592,7 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
     selectors = {}
     raw_groups = {}
     args.upgrade_rules = DEFAULT_UPGRADE_RULES
+    args.image_mappings = {}
     if args.config:
         try:
             with args.config.expanduser().open(encoding="utf-8") as stream:
@@ -576,12 +601,15 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("Input sheet must contain valid YAML") from None
         if not isinstance(document, dict):
             raise ValueError("Input sheet must be a YAML mapping")
-        if set(document) - {"nexus_dashboard", "switches", "update_groups", "upgrade_rules"}:
+        if set(document) - {"nexus_dashboard", "switches", "update_groups", "upgrade_rules", "image_mappings"}:
             raise ValueError(
-                "Input sheet accepts only nexus_dashboard, switches, update_groups, and upgrade_rules sections"
+                "Input sheet accepts only nexus_dashboard, switches, update_groups, upgrade_rules, "
+                "and image_mappings sections"
             )
         if "upgrade_rules" in document:
             args.upgrade_rules = load_upgrade_rules(document["upgrade_rules"])
+        if "image_mappings" in document:
+            args.image_mappings = load_image_mappings(document["image_mappings"])
         settings = document.get("nexus_dashboard") or {}
         selectors = document.get("switches") or {}
         raw_groups = document.get("update_groups") or {}
@@ -718,7 +746,7 @@ def main() -> int:
         images = client.request("GET", IMAGES)
         plans = []
         for name, members in groups:
-            plan = make_plan(name, members, checks, images, args.upgrade_rules)
+            plan = make_plan(name, members, checks, images, args.upgrade_rules, args.image_mappings)
             if plan is None:
                 detail = ", ".join(f"{s.name} {s.model} {s.version}" for s in members)
                 print(f"Skipping {name}: {detail} outside the N9K upgrade rules")
@@ -769,7 +797,8 @@ def main() -> int:
             "default checks remain unchanged"
         )
         checks = ensure_check_catalog(client, current_checks, checks)
-        plans = [make_plan(name, members, checks, images, args.upgrade_rules) for name, members in groups]
+        plans = [make_plan(name, members, checks, images, args.upgrade_rules, args.image_mappings)
+                 for name, members in groups]
         plans = [plan for plan in plans if plan is not None]
         for plan in plans:
             apply_plan(client, plan, checks, attach_by_name[plan.group_name], args.run_pre_report)

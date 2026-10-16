@@ -726,6 +726,121 @@ class UpdaterTests(unittest.TestCase):
 
 
 class NXJobTests(unittest.TestCase):
+    def test_image_selector_accepts_verified_and_present_images_from_nd(self):
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        switch = helpers["Switch"]("S1", "dcmepbmsw001", "", "N9K-C93180YC-EX",
+                                    "9.3(8)", "n9k", "", "", "F1")
+        for version, filename, status in (
+            ("9.3.16", "nxos.9.3.16.bin", "Verified"),
+            ("10.3.10", "nxos64-cs.10.3.10.M.bin", "Present"),
+            ("10.6.4", "nxos64-cs.10.6.4.M.bin", "Present"),
+        ):
+            for version_field in ("releaseVersion", "imageVersion", None):
+                image = {"imageName": filename, "platform": "n9k",
+                         "imagePresent": status, "imageSubType": "nx-os"}
+                if version_field:
+                    image[version_field] = version
+                with self.subTest(version=version, version_field=version_field):
+                    self.assertEqual(helpers["select_image"]({"images": [image]}, switch, version), filename)
+
+    def test_image_mapping_disambiguates_without_bypassing_catalog_checks(self):
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        switch = helpers["Switch"]("S1", "leaf", "", "N9K-C93180YC-FX",
+                                    "10.3(8)", "n9k", "", "", "F1")
+        image = {"imageName": "nxos64-cs.10.6.4.M.bin", "platform": "n9k",
+                 "releaseVersion": "10.6.4", "imagePresent": "Verified", "imageSubType": "nx-os"}
+        other = dict(image, imageName="nxos64-cs.10.6.4.other.bin")
+        with self.assertRaisesRegex(ValueError, "Expected one uploaded"):
+            helpers["select_image"]([image, other], switch, "10.6.4")
+        plan = helpers["make_plan"]("leaf", [switch], [], [image, other],
+                                    image_mappings={"10.6.4": image["imageName"]})
+        self.assertEqual(plan.image_name, image["imageName"])
+        for overrides in (
+            {"platform": "n7k"}, {"releaseVersion": "9.3.16"},
+            {"imagePresent": "Missing"}, {"imagePresent": "Downloading"},
+            {"imageSubType": "kickStart"}, {"imageName": other["imageName"]},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "Requested image"):
+                helpers["select_image"]([dict(image, **overrides)], switch, "10.6.4", image["imageName"])
+        with self.assertRaisesRegex(ValueError, "status=missing"):
+            helpers["select_image"]([dict(image, imagePresent="Missing")], switch, "10.6.4")
+        self.assertEqual(helpers["select_image"]([image, image], switch, "10.6.4"), image["imageName"])
+
+    def test_image_mapping_editor_and_cli_validation(self):
+        from automation_ui import nd_image_mappings_yaml
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        text = 'image_mappings:\n  "9.3.16": nxos.9.3.16.bin\n'
+        document = nd_image_mappings_yaml(text)
+        self.assertEqual(nd_image_mappings_yaml("image_mappings: {}"), {"image_mappings": {}})
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "input.yaml"
+            config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"}, **document}))
+            args = helpers["parse_args"](["--config", str(config)])
+            self.assertEqual(args.image_mappings, document["image_mappings"])
+            args = helpers["parse_args"](["--nd-url", "nd.example.test"])
+            self.assertEqual(args.image_mappings, {})
+        for text in ("", "[", "image_mappings: null", "image_mappings: []", "other: {}",
+                     "image_mappings: {}\nother: {}"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                nd_image_mappings_yaml(text)
+        for invalid in (None, [], {10.6: "nxos.bin"}, {"bad": "nxos.bin"},
+                        {"10.6.4": None}, {"10.6.4": ""}, {"10.6.4": "../nxos.bin"},
+                        {"10.6.4": "/tmp/nxos.bin"}, {"10.6.4": "nxos.bin;cmd"},
+                        {"10.6.4": "nxos.txt"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                helpers["load_image_mappings"](invalid)
+
+    def test_image_mappings_reach_both_cli_plan_and_apply_planning(self):
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        main = helpers["main"]
+        # runpy's function globals, rather than the returned dictionary, drive main.
+        globals_ = main.__globals__
+        mapping = {"9.3.16": "nxos.9.3.16.bin"}
+        checks = [{"reportCheckName": "nxos_mac_address", "cliCommand": "show mac address dynamic | sort"}]
+
+        def request(method, path, payload=None):
+            self.assertEqual(method, "GET")
+            if path == helpers["SWITCHES"]:
+                return [{"switchId": "S1", "switchName": "leaf", "switchModel": "N9K-C93180YC-EX",
+                         "switchVersion": "9.3(8)", "switchPlatform": "n9k", "fabricName": "F1"}]
+            if path == helpers["IMAGES"]:
+                return [{"imageName": filename, "releaseVersion": "9.3.16", "platform": "n9k",
+                         "imageSubType": "nx-os", "imagePresent": "Verified"}
+                        for filename in ("nxos.9.3.16.bin", "nxos.9.3.16.other.bin")]
+            return []
+
+        for apply in (False, True):
+            with self.subTest(apply=apply), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "input.yaml"
+                config.write_text(yaml.safe_dump({
+                    "nexus_dashboard": {"host": "nd.example.test"}, "switches": {"hosts": ["leaf"]},
+                    "image_mappings": mapping,
+                }))
+                client = MagicMock()
+                client.request.side_effect = request
+                planner = MagicMock(wraps=helpers["make_plan"])
+                apply_plan = MagicMock()
+                argv = ["nd_stage_nexus_updates.py", "--config", str(config)] + (["--apply"] if apply else [])
+                with patch.object(sys, "argv", argv), \
+                        patch.dict(os.environ, {"NEXUS_PASSWORD": "synthetic"}), \
+                        patch.dict(globals_, {
+                            "NexusDashboard": MagicMock(return_value=client),
+                            "load_check_catalog": MagicMock(return_value=({}, checks)),
+                            "ensure_check_catalog": MagicMock(return_value=checks),
+                            "make_plan": planner, "apply_plan": apply_plan,
+                        }):
+                    self.assertEqual(main(), 0)
+                self.assertEqual(planner.call_count, 2 if apply else 1)
+                self.assertTrue(all(call.args[-1] == mapping for call in planner.call_args_list))
+                if apply:
+                    self.assertEqual(apply_plan.call_args.args[1].image_name, "nxos.9.3.16.bin")
+                else:
+                    apply_plan.assert_not_called()
+
     def test_bundled_mac_check_is_created_without_existing_definition(self):
         import copy
         from nd_interfaces import nd_helpers
@@ -876,7 +991,8 @@ class NXProcessTests(unittest.IsolatedAsyncioTestCase):
 """
         for apply in (False, True):
             with self.subTest(apply=apply), tempfile.TemporaryDirectory() as directory:
-                storage = {"nd_upgrade_rules_yaml": text}
+                images_text = 'image_mappings:\n  "10.6.4": nxos64-cs.10.6.4.M.bin\n'
+                storage = {"nd_upgrade_rules_yaml": text, "nd_image_mappings_yaml": images_text}
                 job = MagicMock(cancelled=False)
                 job.run = AsyncMock(return_value=0)
                 with Client(ui.page("/_nd_rules_test")), \
@@ -898,6 +1014,9 @@ class NXProcessTests(unittest.IsolatedAsyncioTestCase):
                     rules = next(element for element in elements
                                  if element._props.get("label") == "Upgrade rules YAML")
                     self.assertEqual(rules.value, text)
+                    images = next(element for element in elements
+                                  if element._props.get("label") == "Image mappings YAML")
+                    self.assertEqual(images.value, images_text)
                     next(element for element in elements
                          if element._props.get("label") == "Update group name").value = "leaf"
                     next(element for element in elements
@@ -913,10 +1032,17 @@ class NXProcessTests(unittest.IsolatedAsyncioTestCase):
                     error.assert_not_called()
                     config = factory.call_args.args[2]
                     self.assertEqual(config["upgrade_rules"], yaml.safe_load(text)["upgrade_rules"])
+                    self.assertEqual(config["image_mappings"], yaml.safe_load(images_text)["image_mappings"])
                     self.assertEqual(factory.call_args.kwargs["apply"], apply)
                     job.run.assert_awaited_once()
                     factory.reset_mock()
                     rules.value = "upgrade_rules: []"
+                    await start()
+                    error.assert_called_once()
+                    factory.assert_not_called()
+                    error.reset_mock()
+                    rules.value = text
+                    images.value = "image_mappings: []"
                     await start()
                     error.assert_called_once()
                     factory.assert_not_called()

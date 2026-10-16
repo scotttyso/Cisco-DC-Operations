@@ -22,6 +22,15 @@ upgrade_rules:
   #   source_version: "10.6"
   #   target_version: "10.6.4"
 
+# Optional exact filename overrides for uploaded N9K NX-OS images.
+# Present and Verified images are accepted; omit entries for automatic selection.
+image_mappings: {}
+# To pin images, replace the empty mapping above with:
+# image_mappings:
+#   "9.3.16": nxos.9.3.16.bin
+#   "10.3.10": nxos64-cs.10.3.10.M.bin
+#   "10.6.4": nxos64-cs.10.6.4.M.bin
+
 update_groups:
   leaf-fx-10_6_4:
     hosts:
