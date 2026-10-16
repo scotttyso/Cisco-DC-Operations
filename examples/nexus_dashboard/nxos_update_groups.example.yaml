@@ -31,6 +31,8 @@ image_mappings: {}
 #   "10.3.10": nxos64-cs.10.3.10.M.bin
 #   "10.6.4": nxos64-cs.10.6.4.M.bin
 
+# Members must share a fabric and target image. Incompatible check sets are
+# automatically split using -vpc / -9508 suffixes (names stay within 48 characters).
 update_groups:
   leaf-fx-10_6_4:
     hosts:

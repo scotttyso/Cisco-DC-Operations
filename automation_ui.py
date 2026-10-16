@@ -939,7 +939,8 @@ def nxos_panel(kind: str):
                                 name.tooltip("1-48 letters, digits, underscores, or hyphens")
                                 remove = ui.button(icon="delete_outline").props('flat round aria-label="Remove update group"').tooltip("Remove update group")
                             members = ui.textarea("Member switches", placeholder="leaf101, leaf102").props("outlined dense autogrow").classes("w-full")
-                            members.tooltip("Comma, space, or newline separated. Group members must share a fabric, target image, and check set.")
+                            members.tooltip("Comma, space, or newline separated. Members must share a fabric and target image. "
+                                            "Incompatible checks automatically split vPC/standalone and 9508/other groups.")
                     fields = {"name": name, "hosts": members, "container": container}
                     group_fields.append(fields)
 
@@ -999,7 +1000,8 @@ def nxos_panel(kind: str):
                     selection.update(nd_upgrade_rules_yaml(rules_input.value or ""))
                     selection.update(nd_image_mappings_yaml(images_input.value or ""))
                 if apply.value and not await confirm(
-                    (f"Create/reuse {len(selection['update_groups'])} named ND update group(s) and stage images?"
+                    (f"Create/reuse groups from {len(selection['update_groups'])} named selection(s) and stage images? "
+                     "Mixed check sets may create additional -vpc / -9508 groups."
                      if "update_groups" in selection else "Create per-switch ND update groups and stage images?") if kind == "nd"
                     else "Delete unneeded bootflash images and copy upgrade images?", "Apply staging",
                 ):

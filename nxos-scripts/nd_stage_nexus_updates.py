@@ -4,6 +4,7 @@
 import argparse
 import copy
 import getpass
+import hashlib
 import os
 import re
 import shutil
@@ -452,6 +453,55 @@ def fabric_path(fabric: str, suffix: str) -> str:
     return "/manage/fabrics/{}/{}".format(quote(fabric, safe=""), suffix)
 
 
+def split_update_groups(
+    groups: Sequence[Tuple[str, Sequence[Switch]]], checks: Sequence[Dict[str, Any]], images: Any,
+    upgrade_rules: Sequence[UpgradeRule] = DEFAULT_UPGRADE_RULES,
+    image_mappings: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, Sequence[Switch]]]:
+    used = {name for name, _ in groups}
+    if len(used) != len(groups):
+        raise ValueError("Update group names must be unique")
+    result = []
+    for name, members in groups:
+        partitions = {}
+        for switch in members:
+            signature = tuple(field(check, "reportCheckName") for check in checks
+                              if check_applies_to_switch(check, switch))
+            key = (switch.is_vpc, "9508" in switch.model.upper(), signature)
+            partitions.setdefault(key, []).append(switch)
+        if len({key[2] for key in partitions}) <= 1:
+            result.append((name, members))
+            continue
+        # Splitting checks must not hide invalid fabric, image, or upgrade-rule mixtures.
+        make_plan(name, members, [], images, upgrade_rules, image_mappings)
+        mixed_vpc = len({switch.is_vpc for switch in members}) > 1
+        split_names = []
+        for subset in partitions.values():
+            switch = subset[0]
+            mixed_models = len({
+                "9508" in member.model.upper()
+                for member in members if member.is_vpc == switch.is_vpc
+            }) > 1
+            suffix = ("-vpc" if mixed_vpc and switch.is_vpc else "")
+            suffix += "-9508" if mixed_models and "9508" in switch.model.upper() else ""
+            candidate = name + suffix
+            if suffix and (len(candidate) > 48 or candidate in used):
+                digest = hashlib.sha256((name + suffix).encode()).hexdigest()[:8]
+                candidate = name[:48 - len(suffix) - 9] + "-" + digest + suffix
+            index = 1
+            while candidate in used and candidate != name:
+                tail = f"-{index}{suffix}"
+                candidate = name[:48 - len(tail)] + tail
+                index += 1
+            if candidate == name and any(group_name == name for group_name, _ in result):
+                raise ValueError(f"Cannot generate distinct check-compatible groups for {name}")
+            used.add(candidate)
+            result.append((candidate, subset))
+            split_names.append(f"{candidate} ({len(subset)} switches)")
+        print(f"Splitting update group {name}: " + ", ".join(split_names))
+    return result
+
+
 def group_path(fabric: str, group: str) -> str:
     return fabric_path(fabric, "updateGroups/{}".format(quote(group, safe="")))
 
@@ -744,6 +794,7 @@ def main() -> int:
                 raise ValueError("A switch is listed in more than one update group")
         current_checks, checks = load_check_catalog(client)
         images = client.request("GET", IMAGES)
+        groups = split_update_groups(groups, checks, images, args.upgrade_rules, args.image_mappings)
         plans = []
         for name, members in groups:
             plan = make_plan(name, members, checks, images, args.upgrade_rules, args.image_mappings)

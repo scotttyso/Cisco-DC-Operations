@@ -286,9 +286,18 @@ fields are ignored. Names must be unique and contain 1-48 letters, digits,
 underscores, or hyphens. Empty groups and repeated switch selectors across groups
 are rejected before launching the job. ND inventory resolution also rejects the
 same physical switch selected through different aliases in multiple groups.
-Each group must share a fabric, target image, and check set; vPC and standalone
-switches should be placed in separate compatible groups. Existing-group membership
-and custom-check safeguards remain enforced by the bundled script.
+Each group must share a fabric and target image. If members require different
+checks, the planner automatically splits vPC from standalone switches and 9508
+from other models where needed. Standalone/non-9508 members retain the original
+name; vPC subgroups get `-vpc`, and 9508 subgroups get `-9508` when model checks
+differ within that topology. A subgroup can receive both suffixes.
+Homogeneous groups keep their names. Generated names stay within 48 characters;
+long names are shortened with a stable hash, and collisions with other input or
+generated names are disambiguated. The console plan lists the final names and
+members before any writes. Existing-group membership and custom-check safeguards
+remain enforced: existing groups are not automatically detached, renamed, or
+deleted, so switches already assigned to an old mixed group may need manual
+reassignment in ND.
 
 See [examples/nexus_dashboard/nxos_update_groups.example.yaml](examples/nexus_dashboard/nxos_update_groups.example.yaml)
 for the generated input structure. In the UI, use saved dashboard credentials;

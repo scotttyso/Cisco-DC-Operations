@@ -726,6 +726,111 @@ class UpdaterTests(unittest.TestCase):
 
 
 class NXJobTests(unittest.TestCase):
+    def split_fixture(self):
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        checks = [{"reportCheckName": "nxos_Interface_status", "cliCommand": "show interface"},
+                  {"reportCheckName": "nxos_vPC_state", "cliCommand": "show vpc"},
+                  {"reportCheckName": "nxos_Dual_supervisor_redundancy", "cliCommand": "show module"}]
+        images = [{"imageName": "nxos64-cs.10.6.4.M.bin", "releaseVersion": "10.6.4",
+                   "platform": "n9k", "imagePresent": "Verified", "imageSubType": "nx-os"}]
+
+        def switch(serial, vpc=False, chassis=False, fabric="F1", version="10.3(8)"):
+            return helpers["Switch"](serial, serial, "", "N9K-C9508" if chassis else "N9K-C93240YC-FX2",
+                                     version, "n9k", "peer" if vpc else "", "primary" if vpc else "", fabric)
+        return helpers, checks, images, switch
+
+    def test_mixed_groups_split_with_correct_names_and_checks(self):
+        helpers, checks, images, switch = self.split_fixture()
+        name = "DCM-Access-OOB-Grp1-Odd"
+        members = [switch("s"), switch("v", True), switch("s9508", False, True), switch("v9508", True, True)]
+        result = helpers["split_update_groups"]([(name, members)], checks, images)
+        self.assertEqual({group: [s.serial for s in hosts] for group, hosts in result}, {
+            name: ["s"], name + "-vpc": ["v"], name + "-9508": ["s9508"],
+            name + "-vpc-9508": ["v9508"],
+        })
+        for group, hosts in result:
+            plan = helpers["make_plan"](group, hosts, checks, images)
+            self.assertEqual("nxos_vPC_state" in plan.check_names, hosts[0].is_vpc)
+            self.assertEqual("nxos_Dual_supervisor_redundancy" in plan.check_names,
+                             "9508" in hosts[0].model)
+        homogeneous = [("same", [switch("v1", True), switch("v2", True)])]
+        self.assertEqual(helpers["split_update_groups"](homogeneous, checks, images), homogeneous)
+        # vPC/standalone does not require splitting when the selected checks are identical.
+        original = [(name, members)]
+        self.assertEqual(helpers["split_update_groups"](original, checks[:1], images), original)
+
+    def test_split_names_stay_short_unique_and_deterministic(self):
+        helpers, checks, images, switch = self.split_fixture()
+        groups = [
+            ("x" * 47 + "a", [switch("s1"), switch("v1", True)]),
+            ("x" * 47 + "b", [switch("s2"), switch("v2", True)]),
+            ("group", [switch("s3"), switch("v3", True)]),
+            ("group-vpc", [switch("s4")]),
+        ]
+        first = helpers["split_update_groups"](groups, checks, images)
+        self.assertEqual(first, helpers["split_update_groups"](groups, checks, images))
+        names = [name for name, _ in first]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(all(helpers["GROUP_NAME_RE"].fullmatch(name) for name in names))
+        self.assertTrue(all(name.endswith("-vpc") for name, members in first if members[0].is_vpc))
+        self.assertEqual(sorted(s.serial for _, members in first for s in members),
+                         sorted(s.serial for _, members in groups for s in members))
+
+    def test_split_preserves_fabric_image_and_upgrade_rule_rejections(self):
+        helpers, checks, images, switch = self.split_fixture()
+        for other, expected in (
+            (switch("v", True, fabric="F2"), "spans fabrics"),
+            (switch("v", True, version="10.6(3)"), "outside"),
+            (switch("v", True, version="9.3(8)"), "different images"),
+        ):
+            catalog = images + [{"imageName": "nxos.9.3.16.bin", "releaseVersion": "9.3.16",
+                                 "platform": "n9k", "imagePresent": "Present", "imageSubType": "nx-os"}]
+            with self.subTest(expected=expected), self.assertRaisesRegex(ValueError, expected):
+                helpers["split_update_groups"]([("mixed", [switch("s"), other])], checks, catalog)
+
+    def test_split_groups_reach_plan_apply_and_existing_membership_guards(self):
+        helpers, checks, images, switch = self.split_fixture()
+        globals_ = helpers["main"].__globals__
+        members = [switch("s"), switch("v", True)]
+        for apply, conflict in ((False, False), (True, False), (True, True)):
+            with self.subTest(apply=apply, conflict=conflict), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "input.yaml"
+                config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"},
+                                                 "update_groups": {"mixed": {"hosts": ["s", "v"]}}}))
+
+                def request(method, path, payload=None):
+                    self.assertEqual(method, "GET")
+                    if path == helpers["SWITCHES"]:
+                        return []
+                    if path == helpers["IMAGES"]:
+                        return images
+                    if conflict:
+                        return [{"updateGroupName": "mixed-vpc", "updateGroupSwitches": ["stranger"]}]
+                    return [{"updateGroupName": "mixed-vpc", "updateGroupSwitches": ["v"]}]
+
+                client = MagicMock()
+                client.request.side_effect = request
+                apply_plan = MagicMock()
+                argv = ["script", "--config", str(config)] + (["--apply"] if apply else [])
+                with patch.object(sys, "argv", argv), \
+                        patch.dict(os.environ, {"NEXUS_PASSWORD": "synthetic"}), \
+                        patch.dict(globals_, {
+                            "NexusDashboard": MagicMock(return_value=client),
+                            "load_switches": MagicMock(return_value=members),
+                            "load_check_catalog": MagicMock(return_value=({}, checks)),
+                            "ensure_check_catalog": MagicMock(return_value=checks),
+                            "apply_plan": apply_plan,
+                        }):
+                    self.assertEqual(helpers["main"](), 1 if conflict else 0)
+                if apply and not conflict:
+                    self.assertEqual([call.args[1].group_name for call in apply_plan.call_args_list],
+                                     ["mixed", "mixed-vpc"])
+                    self.assertEqual([call.args[3] for call in apply_plan.call_args_list], [["s"], []])
+                    self.assertEqual([call.args[1].serials for call in apply_plan.call_args_list], [["s"], ["v"]])
+                else:
+                    apply_plan.assert_not_called()
+
     def test_image_selector_accepts_verified_and_present_images_from_nd(self):
         from nd_interfaces import nd_helpers
         helpers = nd_helpers()
