@@ -5,6 +5,23 @@ nexus_dashboard:
   verify_ssl: true
   password_env: DC_ND_PASSWORD
 
+# Optional: replaces all built-in rules. First matching rule wins; N9K only.
+# Quote versions. Omit this section to use these defaults automatically.
+upgrade_rules:
+  - models: ["*"]
+    source_version: "9.3"
+    target_version: "9.3.16"
+  - models: ["*93180YC-EX*", "*93108TC-EX*"]
+    source_version: "10.3"
+    target_version: "10.3.10"
+  - models: ["*"]
+    source_version: "10.3"
+    target_version: "10.6.4"
+  # Verify the supported upgrade path before enabling this example.
+  # - models: ["N9K-C93240YC-FX2"]
+  #   source_version: "10.6"
+  #   target_version: "10.6.4"
+
 update_groups:
   leaf-fx-10_6_4:
     hosts:

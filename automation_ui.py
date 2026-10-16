@@ -33,7 +33,7 @@ from aci_checks import (ATTENTION_STATES, capture_snapshot, delete_old_snapshots
 from aci_ifstatus_common import DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, validate_role_commands
 from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
 from nxos_jobs import NXJob, nd_switch_selection
-from nd_interfaces import InterfaceDescriptions, filter_interface_rows, validate_description
+from nd_interfaces import InterfaceDescriptions, filter_interface_rows, nd_helpers, validate_description
 from interface_description_table import InterfaceDescriptionTable
 from release_updates import installed_version, install_instructions, latest_release
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
@@ -899,6 +899,17 @@ def aci_panel(apic_selector):
     return apic_changed
 
 
+def nd_upgrade_rules_yaml(text: str) -> dict:
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise ValueError("Invalid upgrade rules YAML") from None
+    if not isinstance(document, dict) or set(document) != {"upgrade_rules"}:
+        raise ValueError("Upgrade rules YAML requires only an upgrade_rules list")
+    nd_helpers()["load_upgrade_rules"](document["upgrade_rules"])
+    return document
+
+
 def nxos_panel(kind: str):
     job = None
     group_fields = []
@@ -930,6 +941,16 @@ def nxos_panel(kind: str):
                 add_group()
                 ui.button("Add update group", icon="add", on_click=add_group).props("outline")
             devices = ui.textarea("Switch names, addresses, or serials").props("outlined dense").classes("w-full").bind_visibility_from(group_mode, "value", value="per_switch")
+            default_rules = yaml.safe_dump({"upgrade_rules": [
+                {"models": list(rule.models), "source_version": rule.source_version,
+                 "target_version": rule.target_version}
+                for rule in nd_helpers()["DEFAULT_UPGRADE_RULES"]
+            ]}, sort_keys=False)
+            app.storage.user.setdefault("nd_upgrade_rules_yaml", default_rules)
+            rules_input = ui.textarea("Upgrade rules YAML").props("outlined autogrow").classes("w-full code-input")
+            rules_input.bind_value(app.storage.user, "nd_upgrade_rules_yaml")
+            ui.label("These rules replace all defaults. First match wins; N9K devices only. "
+                     "Quote versions and verify supported upgrade paths before staging.").classes("muted")
             pre_report = ui.checkbox("Request pre-update report before staging", value=False)
         else:
             config_input = ui.textarea("Bootflash YAML configuration", value=BOOTFLASH_EXAMPLE).props("outlined").classes("w-full code-input")
@@ -952,6 +973,8 @@ def nxos_panel(kind: str):
                 selection = nd_switch_selection(group_mode.value, devices.value or "",
                                                 [{"name": group["name"].value or "", "hosts": group["hosts"].value or ""}
                                                  for group in group_fields]) if kind == "nd" else None
+                if kind == "nd":
+                    selection.update(nd_upgrade_rules_yaml(rules_input.value or ""))
                 if apply.value and not await confirm(
                     (f"Create/reuse {len(selection['update_groups'])} named ND update group(s) and stage images?"
                      if "update_groups" in selection else "Create per-switch ND update groups and stage images?") if kind == "nd"

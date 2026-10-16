@@ -11,7 +11,8 @@ import unittest
 import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
 import aci_ifstatus_common as common
@@ -403,6 +404,32 @@ assert arguments.nd_url == 'https://nd.example.com'
 
 
 class NXJobTests(unittest.TestCase):
+    def test_upgrade_rules_editor_validates_and_replaces_defaults(self):
+        from automation_ui import nd_upgrade_rules_yaml
+        from nd_interfaces import nd_helpers
+        config = nd_upgrade_rules_yaml("""upgrade_rules:
+  - models: ["N9K-C93240YC-FX2"]
+    source_version: "10.6"
+    target_version: "10.6.4"
+""")
+        helpers = nd_helpers()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.yaml"
+            path.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"}, **config}))
+            args = helpers["parse_args"](["--config", str(path)])
+        switch = helpers["Switch"]("S1", "r143b-sw1", "", "N9K-C93240YC-FX2",
+                                    "10.6(3)", "n9k", "", "", "F1")
+        self.assertIsNone(helpers["target_for"](switch))
+        self.assertEqual(helpers["target_for"](switch, args.upgrade_rules), "10.6.4")
+        switch = helpers["Switch"]("S2", "other", "", "N9K-C93240YC-FX2",
+                                    "10.3(8)", "n9k", "", "", "F1")
+        self.assertIsNone(helpers["target_for"](switch, args.upgrade_rules))
+        for text in ("", "[", "upgrade_rules: []", "upgrade_rules: null",
+                     "switches: {}", "upgrade_rules: []\nother: true",
+                     "upgrade_rules:\n- models: ['*']\n  source_version: 10.6\n  target_version: '10.6.4'"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                nd_upgrade_rules_yaml(text)
+
     def test_named_group_selection_matches_the_bundled_script(self):
         selection = nd_switch_selection("named", groups=[
             {"name": "leaf-fx-10_6_4", "hosts": "leaf101, leaf102\nleaf101"},
@@ -461,6 +488,63 @@ class NXJobTests(unittest.TestCase):
 
 
 class NXProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nd_ui_passes_edited_rules_to_plan_and_apply(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        text = """upgrade_rules:
+  - models: ["N9K-C93240YC-FX2"]
+    source_version: "10.6"
+    target_version: "10.6.4"
+"""
+        for apply in (False, True):
+            with self.subTest(apply=apply), tempfile.TemporaryDirectory() as directory:
+                storage = {"nd_upgrade_rules_yaml": text}
+                job = MagicMock(cancelled=False)
+                job.run = AsyncMock(return_value=0)
+                with Client(ui.page("/_nd_rules_test")), \
+                        patch.object(web, "app", SimpleNamespace(storage=SimpleNamespace(user=storage))), \
+                        patch.object(web, "owner", return_value="operator"), \
+                        patch.object(web, "dashboard_picker",
+                                     side_effect=lambda label: ui.select({"nd": "ND"}, value="nd")), \
+                        patch.object(web, "STORE", create=True) as store, \
+                        patch.object(web, "saved_credentials", return_value={
+                            "username": "netops", "domain": "local", "password": "synthetic"}), \
+                        patch.object(web, "output_directory", return_value=Path(directory)), \
+                        patch.object(web, "NXJob", return_value=job) as factory, \
+                        patch.object(web, "confirm", new=AsyncMock(return_value=True)), \
+                        patch.object(web, "notify_error") as error:
+                    store.dashboards.return_value = [{"id": "nd", "address": "nd.example.test", "verify_tls": True}]
+                    with ui.column() as container:
+                        web.nxos_panel("nd")
+                    elements = list(container.descendants())
+                    rules = next(element for element in elements
+                                 if element._props.get("label") == "Upgrade rules YAML")
+                    self.assertEqual(rules.value, text)
+                    next(element for element in elements
+                         if element._props.get("label") == "Update group name").value = "leaf"
+                    next(element for element in elements
+                         if element._props.get("label") == "Member switches").value = "r143b-sw1"
+                    next(element for element in elements
+                         if getattr(element, "text", "") == "Apply staging changes").value = apply
+                    button = next(element for element in elements
+                                  if element._props.get("label") == "Run staging")
+                    handler = next(listener.handler for listener in button._event_listeners.values()
+                                   if listener.type == "click")
+                    start = inspect.getclosurevars(handler).nonlocals["callback"]
+                    await start()
+                    error.assert_not_called()
+                    config = factory.call_args.args[2]
+                    self.assertEqual(config["upgrade_rules"], yaml.safe_load(text)["upgrade_rules"])
+                    self.assertEqual(factory.call_args.kwargs["apply"], apply)
+                    job.run.assert_awaited_once()
+                    factory.reset_mock()
+                    rules.value = "upgrade_rules: []"
+                    await start()
+                    error.assert_called_once()
+                    factory.assert_not_called()
+                    container.delete()
+
     async def test_child_environment_is_isolated_and_console_is_redacted(self):
         with tempfile.TemporaryDirectory() as directory, patch("nxos_jobs.Path.is_file", return_value=True):
             job = NXJob("nd", Path(directory) / "job", {}, {"password": "synthetic-job-secret"})

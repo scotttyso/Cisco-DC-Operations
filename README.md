@@ -236,7 +236,25 @@ are unchanged. Authentication protection is per job, not a cross-job lockout gua
   the original single switch-list workflow. Its login/domain/TLS settings come
   from Nexus Dashboards. The default is plan-only. Applying
   creates/reuses update groups, attaches checks, and requests staging; it does not
-  start the NX-OS install. The source script's existing upgrade rules still apply.
+  start the NX-OS install.
+
+The **Upgrade rules YAML** editor is prefilled with the current default rules and
+retains edits in your browser session. Its `upgrade_rules` list replaces all
+defaults for both plan and apply; the first matching rule wins. Model patterns
+are case-insensitive shell-style patterns; only N9K devices are eligible. Quote
+source/target versions. A source of `"10.6"` matches `10.6(3)` and `10.6.3`, not `10.60`.
+For example, append this entry to the editor's list for that model:
+
+```yaml
+  - models: ["N9K-C93240YC-FX2"]
+    source_version: "10.6"
+    target_version: "10.6.4"
+```
+
+Verify your supported upgrade path and target before running. The target image
+must be uploaded to ND. Invalid YAML or malformed/empty rules block the job
+before launching a process. Standalone CLI configs can also include
+`upgrade_rules`; omitting the section preserves the original defaults.
 
 Named mode generates `update_groups` rather than `switches.hosts`; inactive-mode
 fields are ignored. Names must be unique and contain 1-48 letters, digits,

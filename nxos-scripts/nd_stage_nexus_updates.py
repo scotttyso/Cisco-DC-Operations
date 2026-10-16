@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -24,6 +25,20 @@ REPORT_CHECKS = "/manage/updateReports/reportChecks"
 SWITCHES = "/manage/fabricSoftware/switches"
 IMAGES = "/manage/fabricSoftware/images"
 DEFAULT_VAULT_PASSWORD_FILE = Path.home() / ".config" / "cisco-dc-automation" / "vault-password"
+
+
+@dataclass(frozen=True)
+class UpgradeRule:
+    models: Tuple[str, ...]
+    source_version: str
+    target_version: str
+
+
+DEFAULT_UPGRADE_RULES = (
+    UpgradeRule(("*",), "9.3", "9.3.16"),
+    UpgradeRule(("*93180YC-EX*", "*93108TC-EX*"), "10.3", "10.3.10"),
+    UpgradeRule(("*",), "10.3", "10.6.4"),
+)
 
 
 @dataclass(frozen=True)
@@ -170,19 +185,19 @@ def load_switches(payload: Any) -> List[Switch]:
     return sorted(result.values(), key=lambda switch: (switch.fabric, switch.name))
 
 
-def target_for(switch: Switch) -> Optional[str]:
+def target_for(
+    switch: Switch, upgrade_rules: Sequence[UpgradeRule] = DEFAULT_UPGRADE_RULES
+) -> Optional[str]:
     model = switch.model.upper()
     version = switch.version.strip()
     is_n9k = switch.platform.casefold() in {"n9k", "nexus 9000"} or model.startswith("N9K")
     if not is_n9k:
         return None
-    is_ex = "93180YC-EX" in model or "93108TC-EX" in model
-    if re.match(r"^9\.3(?:[.(]|$)", version):
-        return "9.3.16"
-    if re.match(r"^10\.3(?:[.(]|$)", version):
-        if is_ex:
-            return "10.3.10"
-        return "10.6.4"
+    for rule in upgrade_rules:
+        if any(fnmatchcase(model, pattern.upper()) for pattern in rule.models) and re.match(
+            rf"^{re.escape(rule.source_version)}(?:[.(]|$)", version
+        ):
+            return rule.target_version
     return None
 
 
@@ -384,9 +399,10 @@ def device_group_name(switch: Switch) -> str:
 
 
 def make_plan(
-    group_name: str, members: Sequence[Switch], checks: Sequence[Dict[str, Any]], images: Any
+    group_name: str, members: Sequence[Switch], checks: Sequence[Dict[str, Any]], images: Any,
+    upgrade_rules: Sequence[UpgradeRule] = DEFAULT_UPGRADE_RULES,
 ) -> Optional[Plan]:
-    targets = [target_for(switch) for switch in members]
+    targets = [target_for(switch, upgrade_rules) for switch in members]
     if not any(targets):
         return None
     outside = [switch.name for switch, target in zip(members, targets) if not target]
@@ -525,10 +541,33 @@ def apply_plan(
     )
 
 
+def load_upgrade_rules(raw: Any) -> Tuple[UpgradeRule, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("upgrade_rules must be a nonempty list")
+    rules = []
+    for index, rule in enumerate(raw, 1):
+        location = f"upgrade_rules entry {index}"
+        if not isinstance(rule, dict) or set(rule) != {"models", "source_version", "target_version"}:
+            raise ValueError(f"{location} requires only models, source_version, and target_version")
+        models = rule["models"]
+        if not isinstance(models, list) or not models or any(
+            not isinstance(model, str) or not model.strip() for model in models
+        ):
+            raise ValueError(f"{location}.models must be a nonempty list of model patterns")
+        for key in ("source_version", "target_version"):
+            value = rule[key]
+            if not isinstance(value, str) or not re.fullmatch(r"\d+(?:\.\d+)+", value):
+                raise ValueError(f"{location}.{key} must be a quoted dotted version, e.g. '10.6'")
+        rules.append(UpgradeRule(tuple(model.strip() for model in models),
+                                 rule["source_version"], rule["target_version"]))
+    return tuple(rules)
+
+
 def apply_config(args: argparse.Namespace) -> argparse.Namespace:
     settings = {}
     selectors = {}
     raw_groups = {}
+    args.upgrade_rules = DEFAULT_UPGRADE_RULES
     if args.config:
         try:
             with args.config.expanduser().open(encoding="utf-8") as stream:
@@ -537,8 +576,12 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("Input sheet must contain valid YAML") from None
         if not isinstance(document, dict):
             raise ValueError("Input sheet must be a YAML mapping")
-        if set(document) - {"nexus_dashboard", "switches", "update_groups"}:
-            raise ValueError("Input sheet accepts only nexus_dashboard, switches, and update_groups sections")
+        if set(document) - {"nexus_dashboard", "switches", "update_groups", "upgrade_rules"}:
+            raise ValueError(
+                "Input sheet accepts only nexus_dashboard, switches, update_groups, and upgrade_rules sections"
+            )
+        if "upgrade_rules" in document:
+            args.upgrade_rules = load_upgrade_rules(document["upgrade_rules"])
         settings = document.get("nexus_dashboard") or {}
         selectors = document.get("switches") or {}
         raw_groups = document.get("update_groups") or {}
@@ -675,14 +718,14 @@ def main() -> int:
         images = client.request("GET", IMAGES)
         plans = []
         for name, members in groups:
-            plan = make_plan(name, members, checks, images)
+            plan = make_plan(name, members, checks, images, args.upgrade_rules)
             if plan is None:
                 detail = ", ".join(f"{s.name} {s.model} {s.version}" for s in members)
                 print(f"Skipping {name}: {detail} outside the N9K upgrade rules")
                 continue
             plans.append(plan)
         if not plans:
-            raise ValueError("No selected switches match the requested 9.3 or 10.3 upgrade rules")
+            raise ValueError("No selected switches match the configured N9K upgrade rules")
 
         existing_by_fabric = {}
         for fabric in {plan.fabric for plan in plans}:
@@ -726,7 +769,7 @@ def main() -> int:
             "default checks remain unchanged"
         )
         checks = ensure_check_catalog(client, current_checks, checks)
-        plans = [make_plan(name, members, checks, images) for name, members in groups]
+        plans = [make_plan(name, members, checks, images, args.upgrade_rules) for name, members in groups]
         plans = [plan for plan in plans if plan is not None]
         for plan in plans:
             apply_plan(client, plan, checks, attach_by_name[plan.group_name], args.run_pre_report)
