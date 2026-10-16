@@ -24,9 +24,10 @@ if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/cisco-dc-automation --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi
 install -d -m 0755 "${APP_DIR}" "${APP_DIR}/nxos-scripts"
-for module in aci_ifstatus_common aci_leaf_ifstatus_pre aci_leaf_ifstatus_post aci_checks aci_jump secure_profiles nxos_jobs nd_interfaces interface_description_table automation_ui; do
+for module in aci_ifstatus_common aci_leaf_ifstatus_pre aci_leaf_ifstatus_post aci_checks aci_jump secure_profiles oidc_auth release_updates nxos_jobs nd_interfaces interface_description_table automation_ui; do
     install -m 0644 "${PROJECT_DIR}/${module}.py" "${APP_DIR}/"
 done
+install -m 0644 "${PROJECT_DIR}/VERSION" "${APP_DIR}/"
 install -m 0644 "${PROJECT_DIR}/interface_description_table.js" "${APP_DIR}/"
 install -m 0644 "${PROJECT_DIR}/requirements.txt" "${APP_DIR}/"
 install -m 0644 "${SCRIPTS_DIR}/nd_stage_nexus_updates.py" "${SCRIPTS_DIR}/nxos_bootflash_stage.py" "${APP_DIR}/nxos-scripts/"

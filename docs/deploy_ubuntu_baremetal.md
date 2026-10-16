@@ -298,6 +298,11 @@ state. Reset a lost WebUI password by rerunning step 4 for the existing username
 
 ## Updating and Rolling Back
 
+Administrators can check published versions from **Account settings → Check for
+software updates**. Follow the checksum-verified CLI instructions shown there;
+the WebUI does not install code or receive sudo rights. See
+[Releases and Updates](releasing.md) for the release workflow and prerequisites.
+
 Schedule a maintenance window, finish jobs, and back up state/key and the installed
 `/opt/cisco-dc-automation` code/venv. Record the approved dependency set. Verify and
 extract the new source bundle, stop the app, run its `install.sh`, then repeat

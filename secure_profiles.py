@@ -113,6 +113,12 @@ class ProfileStore:
                     apic_id TEXT PRIMARY KEY, commands TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS oidc_secrets (
+                    name TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS oidc_identities (
+                    issuer TEXT NOT NULL, subject TEXT NOT NULL, username TEXT NOT NULL UNIQUE,
+                    preferred_username TEXT NOT NULL, display_name TEXT NOT NULL,
+                    PRIMARY KEY (issuer, subject));
                 CREATE TABLE IF NOT EXISTS nexus_dashboards (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, address TEXT NOT NULL,
                     domain TEXT NOT NULL, verify_tls INTEGER NOT NULL);
@@ -219,6 +225,85 @@ class ProfileStore:
     def has_users(self) -> bool:
         with self.connection() as database:
             return bool(database.execute("SELECT 1 FROM users LIMIT 1").fetchone())
+
+    def oidc_settings(self) -> dict:
+        with self.connection() as database:
+            row = database.execute("SELECT value FROM settings WHERE key = 'oidc_config'").fetchone()
+            secret = database.execute("SELECT 1 FROM oidc_secrets WHERE name = 'client_secret'").fetchone()
+        config = json.loads(row["value"]) if row else {
+            "enabled": False, "issuer": "", "client_id": "",
+            "admin_groups": [], "operator_groups": [],
+        }
+        config["client_secret_saved"] = bool(secret)
+        return config
+
+    def save_oidc_settings(self, actor: str, issuer: str, client_id: str, client_secret: str,
+                           admin_groups: str, operator_groups: str, enabled: bool) -> dict:
+        from oidc_auth import validate_oidc_config
+
+        config = validate_oidc_config(issuer, client_id, admin_groups, operator_groups, enabled)
+        if len(client_secret) > 4096:
+            raise ValueError("OIDC client secret is too long")
+        with self.connection() as database:
+            self.require_admin(database, actor)
+            existing_secret = database.execute(
+                "SELECT 1 FROM oidc_secrets WHERE name = 'client_secret'").fetchone()
+            if config["enabled"] and not client_secret and not existing_secret:
+                raise ValueError("Enter the OIDC client secret before enabling corporate sign-in")
+            if client_secret:
+                encrypted = self.cipher.encrypt(client_secret.encode())
+                database.execute("INSERT OR REPLACE INTO oidc_secrets VALUES ('client_secret', ?)", (encrypted,))
+            database.execute("INSERT OR REPLACE INTO settings VALUES ('oidc_config', ?)",
+                             (json.dumps(config),))
+        return {**config, "client_secret_saved": True if client_secret else bool(existing_secret)}
+
+    def oidc_client_secret(self) -> str:
+        with self.connection() as database:
+            row = database.execute("SELECT encrypted FROM oidc_secrets WHERE name = 'client_secret'").fetchone()
+        return self.cipher.decrypt(row["encrypted"]).decode() if row else ""
+
+    def login_oidc(self, issuer: str, subject: str, preferred_username: str,
+                   display_name: str, role: str) -> dict:
+        if not issuer or not subject or role not in ("admin", "operator"):
+            raise ValueError("OIDC identity is missing required claims")
+        issuer = issuer.rstrip("/")
+        preferred_username = preferred_username.strip()[:128]
+        display_name = display_name.strip()[:128] or preferred_username
+        identity_hash = hashlib.sha256(f"{issuer}\0{subject}".encode()).hexdigest()[:24]
+        with self.connection() as database:
+            identity = database.execute(
+                "SELECT username FROM oidc_identities WHERE issuer = ? AND subject = ?",
+                (issuer, subject)).fetchone()
+            if identity:
+                username = identity["username"]
+                user = database.execute("SELECT role, auth_version, theme FROM users WHERE username = ?",
+                                        (username,)).fetchone()
+                if not user:
+                    raise ValueError("Linked OIDC account is missing")
+                version = user["auth_version"] + (user["role"] != role)
+                database.execute("UPDATE users SET role = ?, auth_version = ? WHERE username = ?",
+                                 (role, version, username))
+                user = database.execute("SELECT role, auth_version, theme FROM users WHERE username = ?",
+                                        (username,)).fetchone()
+                database.execute("UPDATE oidc_identities SET preferred_username = ?, display_name = ? "
+                                 "WHERE issuer = ? AND subject = ?",
+                                 (preferred_username, display_name, issuer, subject))
+            else:
+                username = preferred_username
+                if not username or any(ord(character) < 32 for character in username):
+                    username = "oidc-" + identity_hash
+                if database.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                    username = "oidc-" + identity_hash
+                encoded = password_hash(secrets.token_urlsafe(48))
+                database.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+                                 (username, encoded, role))
+                database.execute("INSERT INTO oidc_identities VALUES (?, ?, ?, ?, ?)",
+                                 (issuer, subject, username, preferred_username, display_name))
+                user = database.execute("SELECT role, auth_version, theme FROM users WHERE username = ?",
+                                        (username,)).fetchone()
+            return {"username": username, "role": user["role"],
+                    "auth_version": user["auth_version"], "theme": user["theme"],
+                    "display_name": display_name}
 
     def apics(self) -> list[dict]:
         with self.connection() as database:

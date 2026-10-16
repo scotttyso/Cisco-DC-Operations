@@ -31,6 +31,9 @@ HTTPS on port 443 by default, or 8443 when sharing an existing Nginx listener. T
 standalone VM uses HTTPS on port 443. HTTP on localhost:8088 is an internal proxy
 hop only. The HTTP development URL above is not the customer deployment.
 
+See [docs/releasing.md](docs/releasing.md) for versioned releases and the
+administrator WebUI update-check/CLI-install workflow.
+
 ### Navigation
 
 Top-level tabs are alphabetical: **APICs**, **Nexus Dashboards**, **Operations**,
@@ -170,17 +173,24 @@ ACI release/platform syntax has not been verified against live hardware here.
 3. Select **POST comparison**, the appropriate PRE snapshot, and odd/even/all or
   specific node IDs, plus the desired role. POST uses the baseline switch list without rediscovering APIC.
 4. Review results, inspect individual command output/differences, and download
-   the full JSON report. Capture history survives restart and includes provenance.
+  the full JSON report. Capture history survives restart and includes provenance.
+  ACI capture history is shared with every WebUI user, including older captures
+  from per-user storage; treat its raw device output as visible to all operators.
+  Administrators can delete shared ACI captures older than a chosen number of
+  days. PRE baselines referenced by newer retained POST captures are preserved;
+  other job and operation reports remain per-user.
 
 PRE captures appear in the **Pre** output tab and open there by default; the
 **Post** tab is populated only by a POST capture. This also applies when viewing
 older saved PRE snapshots, without rerunning any device commands.
 
 Interface results compare normalized physical-port up/down status, including
-missing ports. Other commands use whitespace-trimmed, order-sensitive text diffs:
-**REVIEW** means output changed, not necessarily that the device is unhealthy.
-Temperatures, counters, timestamps, table ordering, and endpoint churn can all
-produce expected differences. **ERROR** and **NO_BASELINE** never count as a match.
+missing ports. `show environment` compares supply/module/fan identity, model, and
+status; output watts, draw, capacity, and total-power values are ignored.
+`show isis adjacency vrf all` compares neighbor system ID, interface, and state;
+hold time, SNPA, and level are ignored. Other commands use whitespace-trimmed,
+order-sensitive text diffs. **REVIEW** means output changed, not necessarily that
+the device is unhealthy. **ERROR** and **NO_BASELINE** never count as a match.
 There is no automatic health verdict for the extra commands. The viewer limits
 individual command text to 60,000 characters; downloaded reports retain full data.
 

@@ -162,6 +162,10 @@ For a complete Ubuntu 26.04 bare-metal or Ubuntu VM procedure, follow the
 deployment types use HTTPS on port 443, with the application backend accessible
 only on loopback. The Rocky Packer VM already uses this arrangement.
 
+For versioned releases, use the admin WebUI to check release notes and obtain
+checksum-verified CLI install instructions; the WebUI service does not have sudo.
+See [Releases and Updates](../docs/releasing.md).
+
 On a dedicated Linux VM with Python 3.10+, OpenSSH clients, and package access,
 run from this repository alone:
 

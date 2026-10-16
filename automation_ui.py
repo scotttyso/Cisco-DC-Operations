@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import queue
+import requests
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -24,13 +25,17 @@ os.environ.setdefault("NICEGUI_STORAGE_PATH", str(DATA_DIR / "sessions"))
 import yaml
 from cryptography.fernet import InvalidToken
 from fastapi import Request
+from fastapi.responses import RedirectResponse
 from nicegui import app, run, ui
 
-from aci_checks import ATTENTION_STATES, capture_snapshot, filter_results, save_snapshot, snapshot_results, summarize_results
+from aci_checks import (ATTENTION_STATES, capture_snapshot, delete_old_snapshots, filter_results, load_snapshots,
+                        save_snapshot, snapshot_results, summarize_results)
 from aci_ifstatus_common import DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, validate_role_commands
+from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
 from nxos_jobs import NXJob, nd_switch_selection
 from nd_interfaces import InterfaceDescriptions, filter_interface_rows, validate_description
 from interface_description_table import InterfaceDescriptionTable
+from release_updates import installed_version, install_instructions, latest_release
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
 
 
@@ -213,6 +218,107 @@ def users_dialog():
                 create_button.enable()
 
         create_button = ui.button("Create user", icon="person_add", on_click=create)
+    dialog.open()
+
+
+def oidc_settings_dialog():
+    actor = owner()
+    if STORE.user(actor).get("role") != "admin":
+        ui.notify("Administrator access is required to configure corporate sign-in", type="negative")
+        return
+    config = STORE.oidc_settings()
+    with ui.dialog() as dialog, ui.card().classes("dialog"):
+        ui.label("Corporate sign-in (OIDC)").classes("section-title")
+        ui.label("Configure a tenant-specific Entra v2 issuer and map exact groups claim IDs to application roles.").classes("muted")
+        with ui.expansion("Entra application setup help", icon="help_outline").classes("w-full"):
+            ui.markdown("""
+There is no SAML service-provider metadata file for this OIDC setup. Send the identity team:
+
+- **Application type:** Web / OpenID Connect, single tenant.
+- **Redirect URI:** `https://<public-host>[:port]/auth/oidc/callback` (use the exact browser-visible hostname and port; omit `:443` on standard HTTPS).
+- **Scopes:** `openid profile email`.
+- **ID token claims:** configure Entra to emit assigned **group object IDs** in the `groups` claim. Group-overage responses are denied by this app.
+
+Ask them to return the tenant-specific v2 **issuer URL**, **application/client ID**, and a new **client secret**. Enter the secret only in this form or an approved secrets channel; it is encrypted with the app vault key. The app discovers OIDC endpoints from `<issuer>/.well-known/openid-configuration`.
+""").classes("w-full")
+        enabled = ui.switch("Enable corporate OIDC sign-in", value=config["enabled"])
+        issuer = ui.input("OIDC issuer URL", value=config["issuer"],
+                          placeholder="https://login.microsoftonline.com/<tenant-id>/v2.0").props("outlined").classes("w-full")
+        client_id = ui.input("Application (client) ID", value=config["client_id"]).props("outlined").classes("w-full")
+        client_secret = ui.input("Client secret", password=True, password_toggle_button=True,
+                                 placeholder="Leave blank to keep the saved secret").props("outlined").classes("w-full")
+        ui.label("Client secret is encrypted with the local vault key. "
+                 + ("A secret is saved." if config["client_secret_saved"] else "No secret is saved yet.")).classes("muted")
+        admin_groups = ui.textarea("Group IDs mapped to Administrator", value="\n".join(config["admin_groups"]),
+                                   placeholder="One Entra group object ID per line").props("outlined autogrow").classes("w-full")
+        operator_groups = ui.textarea("Group IDs mapped to Operator", value="\n".join(config["operator_groups"]),
+                                      placeholder="One Entra group object ID per line").props("outlined autogrow").classes("w-full")
+        ui.label("Register this exact redirect path in Entra: /auth/oidc/callback. "
+                 "Local password sign-in remains available for recovery.").classes("muted")
+
+        async def save():
+            secret = client_secret.value or ""
+            client_secret.value = ""
+            save_button.disable()
+            try:
+                current_actor = owner()
+                saved = await run.io_bound(
+                    STORE.save_oidc_settings, current_actor, issuer.value or "", client_id.value or "",
+                    secret, admin_groups.value or "", operator_groups.value or "", bool(enabled.value))
+                ui.notify("Corporate sign-in settings saved" if saved["enabled"]
+                          else "Corporate sign-in disabled; local login remains available", type="positive")
+                dialog.close()
+            except ValueError as error:
+                notify_error(error)
+            finally:
+                save_button.enable()
+
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            save_button = ui.button("Save OIDC settings", icon="save", on_click=save)
+    dialog.open()
+
+
+def updates_dialog():
+    actor = owner()
+    if STORE.user(actor).get("role") != "admin":
+        ui.notify("Administrator access is required to check releases", type="negative")
+        return
+    with ui.dialog() as dialog, ui.card().classes("dialog").style("width: min(900px, 94vw); max-width: 900px"):
+        ui.label("Software updates").classes("section-title")
+        ui.label(f"Installed release: {installed_version()}").classes("muted")
+        status = ui.label("Check GitHub for the latest published release.").classes("muted")
+        result = ui.column().classes("w-full gap-3")
+
+        async def check_updates():
+            check_button.disable()
+            status.text = "Checking GitHub Releases..."
+            result.clear()
+            try:
+                release = await run.io_bound(latest_release)
+                owner()
+                current = installed_version()
+                if current == release["tag"]:
+                    status.text = f"{release['tag']} is the latest published release."
+                else:
+                    status.text = f"Latest release: {release['tag']} (installed: {current})"
+                with result:
+                    ui.link("View release notes on GitHub", release["url"], new_tab=True)
+                    ui.label(release["notes"][:12000]).classes("w-full")
+                    if current != release["tag"]:
+                        ui.label("After reviewing the release, sign in to the server CLI, "
+                                 "finish active jobs, and back up the data and vault key separately before installing.").classes("muted")
+                        ui.code(install_instructions(release["tag"]), language="bash").classes("w-full")
+            except (ValueError, requests.RequestException) as error:
+                status.text = str(error)
+            except Exception:
+                status.text = "Unable to check GitHub releases; verify server connectivity and try again."
+            finally:
+                check_button.enable()
+
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Close", on_click=dialog.close).props("flat")
+            check_button = ui.button("Check for updates", icon="system_update", on_click=check_updates)
     dialog.open()
 
 
@@ -405,6 +511,12 @@ def login_page(request: Request):
     with ui.element("div").classes("login-wrap"):
         with ui.column().classes("login-form gap-4"):
             ui.label("Sign in").classes("heading")
+            oidc_error = request.session.pop("oidc_error", "")
+            if oidc_error:
+                ui.label(oidc_error).classes("text-negative")
+            oidc_config = STORE.oidc_settings()
+            if oidc_config["enabled"]:
+                ui.link("Sign in with corporate account", "/auth/oidc/login").classes("w-full")
             username = ui.input("WebUI username").props("outlined autocomplete=username").classes("w-full")
             password = ui.input("WebUI password", password=True, password_toggle_button=True).props(
                 "outlined autocomplete=current-password").classes("w-full")
@@ -426,7 +538,8 @@ def login_page(request: Request):
                 if account:
                     app.storage.user.clear()
                     app.storage.user.update(username=name, authenticated_at=time.time(),
-                                            auth_version=account["auth_version"], theme=account["theme"])
+                                            auth_version=account["auth_version"], theme=account["theme"],
+                                            display_name=name, auth_method="local")
                     LOGIN_ATTEMPTS.pop(key, None)
                     ui.navigate.to("/")
                 else:
@@ -434,6 +547,54 @@ def login_page(request: Request):
 
             ui.button("Sign in", icon="login", on_click=login).classes("w-full")
             password.on("keydown.enter", login)
+
+
+@app.get("/auth/oidc/login")
+async def oidc_login(request: Request):
+    config = STORE.oidc_settings()
+    if not config["enabled"]:
+        request.session["oidc_error"] = "Corporate sign-in is not enabled."
+        return RedirectResponse("/login", status_code=303)
+    try:
+        client = create_oidc_client(config, STORE.oidc_client_secret())
+        redirect_uri = str(request.url_for("oidc_callback"))
+        return await client.authorize_redirect(request, redirect_uri)
+    except Exception:
+        request.session["oidc_error"] = "Unable to start corporate sign-in; verify the OIDC settings."
+        return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/auth/oidc/callback", name="oidc_callback")
+async def oidc_callback(request: Request):
+    try:
+        config = STORE.oidc_settings()
+        if not config["enabled"]:
+            raise OIDCLoginError("Corporate sign-in is not enabled")
+        client = create_oidc_client(config, STORE.oidc_client_secret())
+        token = await client.authorize_access_token(request)
+        claims = token.get("userinfo")
+        if not isinstance(claims, dict):
+            raise OIDCLoginError("The identity provider did not return a validated ID token")
+        issuer = str(claims.get("iss", "")).rstrip("/")
+        if issuer != config["issuer"].rstrip("/"):
+            raise OIDCLoginError("The identity provider issuer does not match the configured tenant")
+        subject = str(claims.get("sub", ""))
+        role = role_from_claims(claims, config)
+        preferred_username = str(claims.get("preferred_username") or claims.get("email") or "")
+        display_name = str(claims.get("name") or preferred_username)
+        account = await run.io_bound(STORE.login_oidc, issuer, subject, preferred_username, display_name, role)
+        app.storage.user.clear()
+        app.storage.user.update(username=account["username"], authenticated_at=time.time(),
+                                auth_version=account["auth_version"], theme=account["theme"],
+                                display_name=account["display_name"], auth_method="oidc")
+        request.session.pop("oidc_error", None)
+        return RedirectResponse("/", status_code=303)
+    except OIDCLoginError as error:
+        message = str(error)
+    except Exception:
+        message = "Corporate sign-in failed; verify the tenant configuration and required group claims."
+    request.session["oidc_error"] = message
+    return RedirectResponse("/login", status_code=303)
 
 
 def aci_panel(apic_selector):
@@ -500,11 +661,7 @@ def aci_panel(apic_selector):
             baseline_options.clear()
             profile = selected_apic()
             if profile:
-                directory = output_directory() / "aci" / profile["id"]
-                for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-                    snapshot = json.loads(path.read_text(encoding="utf-8"))
-                    if snapshot["apic"] != profile["address"]:
-                        continue
+                for snapshot in load_snapshots(DATA_DIR, profile["id"], profile["address"]):
                     snapshots[snapshot["id"]] = snapshot
                     if snapshot["phase"] == "pre":
                         baseline_options[snapshot["id"]] = f"{snapshot['captured_at']} | {snapshot['group']} | {len(snapshot['nodes'])} switches"
@@ -572,7 +729,7 @@ def aci_panel(apic_selector):
                 if ssh_route.value == "nd":
                     jump = ssh_jump(jump_dashboard.value)
                     values["rescue_password"] = jump["password"]
-                directory = output_directory() / "aci" / profile["id"]
+                directory = DATA_DIR / "captures" / "aci" / profile["id"]
                 settings = dict(group=group.value, node_ids=node_ids.value or "", workers=int(workers.value),
                                 connect_timeout=int(connect_timeout.value), read_timeout=int(read_timeout.value),
                                 notify=messages.put, role=capture_role.value, dns_domain=STORE.dns_domain(),
@@ -677,7 +834,8 @@ def aci_panel(apic_selector):
                     with ui.tab_panels(detail_tabs, value="Pre" if current_snapshot["phase"] == "pre" else "Difference").classes("w-full"):
                         for label, name in (("Difference", "detail"), ("Pre", "pre"), ("Post", "post")):
                             with ui.tab_panel(label):
-                                ui.code((row[name] or "No output")[:60000], language="text").classes("w-full")
+                                ui.code((row[name] or "No output")[:60000],
+                                        language="diff" if name == "detail" else "text").classes("w-full")
                 dialog.open()
 
             def download():
@@ -687,9 +845,40 @@ def aci_panel(apic_selector):
                               "summary": summarize_results(all_results)}
                     ui.download.content(json.dumps(report, indent=2), filename=f"aci-{current_snapshot['id']}.json")
 
+            def delete_old_captures():
+                username = owner()
+                if STORE.user(username).get("role") != "admin":
+                    ui.notify("Administrator access is required to delete shared captures", type="negative")
+                    return
+                with ui.dialog() as dialog, ui.card().classes("dialog"):
+                    ui.label("Delete old shared ACI captures").classes("section-title")
+                    retention_days = ui.number("Delete captures older than (days)", value=90, min=1,
+                                                precision=0).props("outlined dense")
+                    ui.label("Applies across all APICs and legacy per-user captures. PRE baselines used by newer POST captures are kept.").classes("muted")
+
+                    async def remove_old_captures():
+                        owner()
+                        days = int(retention_days.value or 0)
+                        if days < 1:
+                            ui.notify("Retention must be at least one day", type="negative")
+                            return
+                        deleted = await run.io_bound(delete_old_snapshots, DATA_DIR, days)
+                        owner()
+                        dialog.close()
+                        apic_changed()
+                        ui.notify(f"Deleted {deleted} old ACI capture(s)", type="positive" if deleted else "info")
+
+                    with ui.row().classes("w-full justify-end"):
+                        ui.button("Cancel", on_click=dialog.close).props("flat")
+                        ui.button("Delete captures", icon="delete_sweep", color="negative",
+                                  on_click=remove_old_captures)
+                dialog.open()
+
             with ui.row():
                 ui.button("Inspect result", icon="search", on_click=inspect).props("outline")
                 ui.button("Download report", icon="download", on_click=download).props("outline")
+            if STORE.user(owner()).get("role") == "admin":
+                ui.button("Delete old captures", icon="delete_sweep", on_click=delete_old_captures).props("outline")
 
     def apic_changed():
         current_snapshot.clear()
@@ -1407,7 +1596,7 @@ def workspace():
             ui.icon("hub", size="26px")
             ui.label("Cisco DC Operations").classes("brand")
             ui.space()
-            ui.label(username).classes("account")
+            ui.label(app.storage.user.get("display_name", username)).classes("account")
             theme_control(username)
             with ui.button(icon="manage_accounts").props('flat round color=white aria-label="Account settings"'):
                 ui.tooltip("Account settings")
@@ -1415,6 +1604,8 @@ def workspace():
                     ui.menu_item("Change password", on_click=password_dialog)
                     if STORE.user(username)["role"] == "admin":
                         ui.menu_item("User accounts", on_click=users_dialog)
+                        ui.menu_item("Corporate sign-in (OIDC)", on_click=oidc_settings_dialog)
+                        ui.menu_item("Check for software updates", on_click=updates_dialog)
             ui.button(icon="logout", on_click=logout).props('flat round color=white aria-label="Sign out"').tooltip("Sign out")
     with ui.column().classes("workspace gap-0"):
         ui.label("Data Center Operations").classes("heading")

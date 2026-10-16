@@ -8,7 +8,8 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 SOURCE_FILES = (
-    "requirements.txt", "aci_ifstatus_common.py", "aci_leaf_ifstatus_pre.py",
+    "VERSION", "requirements.txt", "oidc_auth.py", "release_updates.py",
+    "aci_ifstatus_common.py", "aci_leaf_ifstatus_pre.py",
     "aci_leaf_ifstatus_post.py", "aci_checks.py", "aci_jump.py", "secure_profiles.py", "nxos_jobs.py",
     "automation_ui.py", "nd_interfaces.py", "interface_description_table.py", "interface_description_table.js",
     "nxos-scripts/nd_stage_nexus_updates.py",

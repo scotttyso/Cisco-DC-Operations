@@ -6,7 +6,7 @@ import difflib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -130,6 +130,81 @@ def snapshot_results(snapshot: dict, baseline: dict | None = None) -> list[dict]
             for result in [entry["commands"].get(command, {})]]
 
 
+def _environment_signature(output: str) -> dict | None:
+    components = {}
+    sections = set()
+    section = None
+    for line in output.splitlines():
+        columns = line.split()
+        if (len(columns) >= 3 and columns[0].lower() in {"supply", "module"}
+                and "model" in {value.lower() for value in columns}
+                and "status" in {value.lower() for value in columns}):
+            section = columns[0].lower()
+            sections.add(section)
+            continue
+        if section is None:
+            continue
+        if not line.strip():
+            section = None
+            continue
+        if not line.strip(" -"):
+            continue
+        if line.lstrip().startswith("(") and "watt" in line.lower():
+            continue
+        values = line.split()
+        if (len(values) >= 3 and
+                (values[0].isdigit() or values[0].lower().startswith("fan"))):
+            components[f"{section} {values[0]}"] = {
+                "model": values[1], "status": values[-1],
+            }
+        else:
+            section = None
+    if sections != {"supply", "module"} or not components:
+        return None
+    return components
+
+
+def _isis_signature(output: str) -> dict | None:
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        header = line.lower()
+        if not all(field in header for field in ("system id", "snpa", "level", "state", "hold time", "interface")):
+            continue
+        adjacencies = {}
+        for row in lines[index + 1:]:
+            if not row.strip():
+                if adjacencies:
+                    break
+                continue
+            if not row.strip(" -"):
+                continue
+            values = row.split()
+            if (len(values) >= 6 and
+                    values[-1].lower().startswith(("ethernet", "eth", "port-channel", "po"))):
+                system_id, state = values[0], values[3]
+                interface = values[-1]
+                adjacencies[f"neighbor {system_id} on {interface}"] = {"state": state}
+            elif adjacencies:
+                break
+        return adjacencies
+    return None
+
+
+def _output_diff(before: str, after: str) -> str:
+    pre_lines = [line.rstrip() for line in before.strip().splitlines()]
+    post_lines = [line.rstrip() for line in after.strip().splitlines()]
+    return "\n".join(difflib.unified_diff(pre_lines, post_lines, fromfile="pre", tofile="post", lineterm=""))
+
+
+def _signature_diff(before: dict, after: dict) -> str:
+    def lines(signature):
+        return [f"{key} | " + " | ".join(f"{field}={value}" for field, value in sorted(values.items()))
+                for key, values in sorted(signature.items())]
+
+    return "\n".join(difflib.unified_diff(lines(before), lines(after),
+                                           fromfile="pre", tofile="post", lineterm=""))
+
+
 def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
     if baseline["apic_id"] != current["apic_id"] or baseline["apic"] != current["apic"]:
         raise ValueError("Cannot compare snapshots from different APICs")
@@ -159,11 +234,20 @@ def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
                         detail = "\n".join(f"{port}: {old} -> {new} {reason}"
                                            for port, old, new, reason in differences)
             else:
-                pre_lines = [line.rstrip() for line in pre["output"].strip().splitlines()]
-                post_lines = [line.rstrip() for line in post["output"].strip().splitlines()]
-                if pre_lines != post_lines:
+                normalizer = {
+                    "show environment": _environment_signature,
+                    "show isis adjacency vrf all": _isis_signature,
+                }.get(command)
+                before_text, after_text = pre["output"], post["output"]
+                before_signature = normalizer(before_text) if normalizer else None
+                after_signature = normalizer(after_text) if normalizer else None
+                if before_signature is not None and after_signature is not None:
+                    if before_signature != after_signature:
+                        state = "REVIEW"
+                        detail = _signature_diff(before_signature, after_signature)
+                elif before_text.strip() != after_text.strip():
                     state = "REVIEW"
-                    detail = "\n".join(difflib.unified_diff(pre_lines, post_lines, fromfile="pre", tofile="post", lineterm=""))
+                    detail = _output_diff(before_text, after_text)
             rows.append({"id": f"{node_id}:{command}", "node_id": node_id,
                          "role": entry["leaf"].get("role", "leaf"),
                          "name": entry["leaf"]["name"], "command": command,
@@ -245,3 +329,72 @@ def save_snapshot(directory: Path, snapshot: dict) -> Path:
         json.dump(snapshot, stream, indent=2)
     path.chmod(0o600)
     return path
+
+
+def _snapshot_time(snapshot: dict) -> datetime | None:
+    try:
+        captured_at = datetime.fromisoformat(snapshot["captured_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return captured_at.replace(tzinfo=timezone.utc) if captured_at.tzinfo is None else captured_at
+
+
+def _snapshot_directories(data_dir: Path, apic_id: str | None = None) -> list[Path]:
+    directories = []
+    shared_root = data_dir / "captures" / "aci"
+    if shared_root.is_dir():
+        directories.extend(path for path in shared_root.iterdir()
+                           if path.is_dir() and (apic_id is None or path.name == apic_id))
+    runs = data_dir / "runs"
+    if runs.is_dir():
+        for owner_dir in runs.iterdir():
+            aci_dir = owner_dir / "aci"
+            if not owner_dir.is_dir() or not aci_dir.is_dir():
+                continue
+            directories.extend(path for path in aci_dir.iterdir()
+                               if path.is_dir() and (apic_id is None or path.name == apic_id))
+    return directories
+
+
+def load_snapshots(data_dir: Path, apic_id: str, apic_address: str) -> list[dict]:
+    snapshots = {}
+    for directory in _snapshot_directories(data_dir, apic_id):
+        for path in directory.glob("*.json"):
+            try:
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (snapshot.get("apic_id") == apic_id and snapshot.get("apic") == apic_address
+                    and snapshot.get("id")):
+                snapshots.setdefault(snapshot["id"], snapshot)
+    return sorted(snapshots.values(),
+                  key=lambda snapshot: _snapshot_time(snapshot) or datetime.min.replace(tzinfo=timezone.utc),
+                  reverse=True)
+
+
+def delete_old_snapshots(data_dir: Path, older_than_days: int,
+                         now: datetime | None = None) -> int:
+    if older_than_days < 1:
+        raise ValueError("Retention must be at least one day")
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=older_than_days)
+    records = []
+    for directory in _snapshot_directories(data_dir):
+        for path in directory.glob("*.json"):
+            try:
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            captured_at = _snapshot_time(snapshot)
+            if captured_at is not None:
+                records.append((path, snapshot, captured_at))
+    protected_baselines = {
+        snapshot.get("baseline_id") for _, snapshot, captured_at in records
+        if snapshot.get("phase") == "post" and captured_at >= cutoff
+    }
+    deleted = 0
+    for path, snapshot, captured_at in records:
+        if (captured_at < cutoff and
+                not (snapshot.get("phase") == "pre" and snapshot.get("id") in protected_baselines)):
+            path.unlink()
+            deleted += 1
+    return deleted

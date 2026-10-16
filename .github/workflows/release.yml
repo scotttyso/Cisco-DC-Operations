@@ -1,0 +1,42 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies and run tests
+        run: |
+          python -m pip install -r requirements.txt
+          python -m unittest test_upgrade_checks
+      - name: Validate tag and package source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH, optionally with a prerelease suffix." >&2
+            exit 1
+          fi
+          printf '%s\n' "$GITHUB_REF_NAME" > VERSION
+          archive="cisco-dc-operations-${GITHUB_REF_NAME}.tar.gz"
+          python3 automation-appliance/scripts/package_source.py "$archive"
+          sha256sum "$archive" > "$archive.sha256"
+          sha256sum --check "$archive.sha256"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="cisco-dc-operations-${GITHUB_REF_NAME}.tar.gz"
+          gh release create "$GITHUB_REF_NAME" "$archive" "$archive.sha256" \
+            --title "$GITHUB_REF_NAME" --generate-notes

@@ -9,12 +9,16 @@ import tempfile
 import tarfile
 import unittest
 import yaml
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
 import aci_ifstatus_common as common
-from aci_checks import capture_snapshot, compare_snapshots, filter_results, save_snapshot, select_leaves, snapshot_results, summarize_results
+from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims, validate_oidc_config
+from release_updates import RELEASES_API, install_instructions, latest_release, release_details
+from aci_checks import (capture_snapshot, compare_snapshots, delete_old_snapshots, filter_results,
+                        load_snapshots, save_snapshot, select_leaves, snapshot_results, summarize_results)
 from nxos_jobs import NXJob, nd_switch_selection, reject_plaintext_passwords, validate_bootflash_config
 from nd_interfaces import InterfaceDescriptions, description_payload, filter_interface_rows, interface_path
 
@@ -342,6 +346,7 @@ assert arguments.nd_url == 'https://nd.example.com'
                 names = archive.getnames()
                 self.assertEqual(set(names), set(packaging.SOURCE_FILES))
                 self.assertIn("nxos-scripts/nd_stage_nexus_updates.py", names)
+                self.assertTrue({"oidc_auth.py", "release_updates.py", "VERSION"}.issubset(names))
                 self.assertFalse(any(".venv" in name or "vault.key" in name or ".pkrvars" in name for name in names))
 
     def test_ova_has_local_identity_valid_hashes_and_ordered_members(self):
@@ -518,10 +523,58 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(all(row["state"] == "NO_BASELINE"
                     for row in compare_snapshots({**pre, "nodes": []}, post)))
         self.assertEqual(post["baseline_id"], pre["id"])
+        rows = {row["command"]: row for row in snapshot_results(post, pre)}
+        for command in (common.COMMAND, "show environment"):
+            self.assertEqual(rows[command]["post"], post["nodes"][0]["commands"][command]["output"])
         client.login.assert_called_once()
         client.logout.assert_called_once()
         with self.assertRaises(ValueError):
             capture_snapshot({**profile, "id": "other-fabric"}, "netops", "synthetic", baseline=pre)
+
+    def test_capture_history_combines_shared_and_legacy_user_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            common_fields = {"apic_id": "fabric", "apic": "192.0.2.1", "nodes": []}
+            legacy = {**common_fields, "id": "legacy", "phase": "pre",
+                      "captured_at": "2026-01-01T00:00:00+00:00"}
+            shared = {**common_fields, "id": "shared", "phase": "post",
+                      "captured_at": "2026-01-02T00:00:00+00:00"}
+            save_snapshot(root / "runs" / "user-a" / "aci" / "fabric", legacy)
+            save_snapshot(root / "captures" / "aci" / "fabric", shared)
+            snapshots = load_snapshots(root, "fabric", "192.0.2.1")
+        self.assertEqual([snapshot["id"] for snapshot in snapshots], ["shared", "legacy"])
+
+    def test_age_cleanup_removes_old_captures_but_keeps_baseline_for_retained_post(self):
+        now = datetime(2026, 10, 15, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "runs" / "user-a" / "aci" / "fabric"
+            shared = root / "captures" / "aci" / "fabric"
+
+            def save(folder, snapshot_id, phase, age_days, baseline_id=None):
+                return save_snapshot(folder, {
+                    "id": snapshot_id, "phase": phase,
+                    "captured_at": (now - timedelta(days=age_days)).isoformat(),
+                    "baseline_id": baseline_id, "apic_id": "fabric",
+                    "apic": "192.0.2.1", "nodes": [],
+                })
+
+            required_pre = save(legacy, "required-pre", "pre", 180)
+            retained_post = save(shared, "retained-post", "post", 5, "required-pre")
+            old_pre = save(shared, "old-pre", "pre", 120)
+            old_post = save(legacy, "old-post", "post", 120, "old-pre")
+            deleted = delete_old_snapshots(root, 90, now)
+            self.assertEqual(deleted, 2)
+            self.assertTrue(required_pre.exists())
+            self.assertTrue(retained_post.exists())
+            self.assertFalse(old_pre.exists())
+            self.assertFalse(old_post.exists())
+
+    def test_age_cleanup_rejects_zero_or_negative_retention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for days in (0, -1):
+                with self.subTest(days=days), self.assertRaises(ValueError):
+                    delete_old_snapshots(Path(directory), days)
 
 
 class SummaryTests(unittest.TestCase):
@@ -648,6 +701,78 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(rows["show module"]["state"], "MATCH")
         pre["nodes"][0]["commands"]["show module"]["status"] = "ERROR"
         self.assertEqual(compare_snapshots(pre, post)[6]["state"], "NO_BASELINE")
+
+    def test_environment_comparison_ignores_power_draw_but_checks_model_and_status(self):
+        import copy
+        pre = {"apic_id": "fabric", "apic": "192.0.2.1", "nodes": [{
+            "leaf": {"node_id": "101", "name": "leaf101"}, "error": "",
+            "commands": {"show environment": {"status": "OK", "output": ""}},
+        }]}
+        pre_output = (
+            "Supply    Model                    Output     Capacity    Status\n"
+            "                                 (Watts )     (Watts )\n"
+            "-------  -------------------  -----------  -----------  --------------\n"
+            "1        NXA-PAC-1100W-PI2          132 W       1100 W        ok\n"
+            "2        NXA-PAC-1100W-PI2          114 W       1100 W        ok\n\n"
+            "Module     Model                     Draw    Allocated    Status\n"
+            "                                  (Watts )     (Watts )\n"
+            "--------  -------------------  -----------  -----------  --------------\n"
+            "1         N9K-C9332C                 246 W        600 W    Powered-Up\n"
+            "fan1      NXA-FAN-35CFM-PI             N/A          N/A    Powered-Up\n\n"
+            "Total Power Capacity (based on configured mode)                2200 W\n"
+            "Total Power of all Inputs (cumulative)                         2200 W\n"
+            "Total Power Output (actual draw)                                246 W\n"
+            "Total Power Allocated (budget)                                N/A\n"
+            "Total Power Available for additional modules                  N/A\n"
+        )
+        pre["nodes"][0]["commands"]["show environment"]["output"] = pre_output
+        post = copy.deepcopy(pre)
+        post_output = (pre_output.replace("132 W", "134 W").replace("114 W", "116 W")
+                       .replace("246 W", "250 W"))
+        post["nodes"][0]["commands"]["show environment"]["output"] = post_output
+        rows = {row["command"]: row for row in compare_snapshots(pre, post)}
+        self.assertEqual(rows["show environment"]["state"], "MATCH")
+        post_output = post_output.replace("N9K-C9332C", "N9K-C9336C")
+        post["nodes"][0]["commands"]["show environment"]["output"] = post_output
+        changed_model = {row["command"]: row for row in compare_snapshots(pre, post)}["show environment"]
+        self.assertEqual(changed_model["state"], "REVIEW")
+        self.assertIn("model=N9K-C9332C", changed_model["detail"])
+        post_output = pre_output.replace("        ok", "        failed", 1)
+        post["nodes"][0]["commands"]["show environment"]["output"] = post_output
+        rows = {row["command"]: row for row in compare_snapshots(pre, post)}
+        self.assertEqual(rows["show environment"]["state"], "REVIEW")
+
+    def test_isis_comparison_ignores_hold_time_but_checks_adjacency_identity_and_state(self):
+        import copy
+        pre_output = (
+            "IS-IS process: isis_infra VRF:overlay-1\n"
+            "IS-IS adjacency database:\n"
+            "System ID         SNPA            Level  State  Hold Time  Interface\n"
+            "4370.4064.0000     N/A            1      UP     00:00:55   Ethernet1/31.35\n"
+            "4270.4064.0000     N/A            1      UP     00:01:01   Ethernet1/32.36\n"
+        )
+        pre = {"apic_id": "fabric", "apic": "192.0.2.1", "nodes": [{
+            "leaf": {"node_id": "101", "name": "leaf101"}, "error": "",
+            "commands": {"show isis adjacency vrf all": {"status": "OK", "output": pre_output}},
+        }]}
+        post = copy.deepcopy(pre)
+        post_output = pre_output.replace("00:00:55", "00:00:51").replace("00:01:01", "00:00:55")
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = post_output
+        rows = {row["command"]: row for row in compare_snapshots(pre, post)}
+        self.assertEqual(rows["show isis adjacency vrf all"]["state"], "MATCH")
+        post_output = post_output.replace("N/A            1      UP", "changed-snpa    2      UP")
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = post_output
+        rows = {row["command"]: row for row in compare_snapshots(pre, post)}
+        self.assertEqual(rows["show isis adjacency vrf all"]["state"], "MATCH")
+        post_output = post_output.replace("UP     00:00:51", "DOWN   00:00:51")
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = post_output
+        changed_state = {row["command"]: row for row in compare_snapshots(pre, post)}["show isis adjacency vrf all"]
+        self.assertEqual(changed_state["state"], "REVIEW")
+        self.assertIn("state=DOWN", changed_state["detail"])
+        post_output = pre_output.replace("Ethernet1/31.35", "Ethernet1/31.36")
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = post_output
+        rows = {row["command"]: row for row in compare_snapshots(pre, post)}
+        self.assertEqual(rows["show isis adjacency vrf all"]["state"], "REVIEW")
 
     @patch("aci_checks.capture_leaf_commands")
     def test_post_auth_rejection_stops_unproven_credentials(self, capture):
@@ -821,6 +946,88 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(set(account), {"username", "role", "auth_version", "theme"})
         self.assertEqual(self.store.login_account("operator", "wrong"), {})
         self.assertNotIn(b"test-web-password", self.store.path.read_bytes())
+
+    def test_oidc_config_is_admin_only_group_mapped_and_secret_is_encrypted(self):
+        self.store.add_user("administrator", "test-admin-password")
+        self.store.create_user("operator", "regular", "test-regular-password", "operator")
+        with self.assertRaises(ValueError):
+            self.store.save_oidc_settings("regular", "https://issuer.example/tenant", "client", "secret",
+                                          "admins", "operators", True)
+        with self.assertRaises(ValueError):
+            self.store.save_oidc_settings("administrator", "http://issuer.example/tenant", "client", "secret",
+                                          "admins", "operators", True)
+        with self.assertRaises(ValueError):
+            self.store.save_oidc_settings("administrator", "https://issuer.example/tenant", "client", "secret",
+                                          "same-group", "same-group", True)
+        with self.assertRaises(ValueError):
+            self.store.save_oidc_settings("administrator", "https://issuer.example/tenant", "client", "secret",
+                                          "", "operators", True)
+        config = self.store.save_oidc_settings("administrator", "https://issuer.example/tenant/", "client",
+                                               "client-secret", "admins\nadmins", "operators", True)
+        self.assertEqual(config["issuer"], "https://issuer.example/tenant")
+        self.assertEqual(config["admin_groups"], ["admins"])
+        self.assertEqual(self.store.oidc_client_secret(), "client-secret")
+        self.assertNotIn(b"client-secret", self.store.path.read_bytes())
+        self.assertEqual(self.store.save_oidc_settings("administrator", "https://issuer.example/tenant", "client",
+                                                        "", "admins", "operators", True)["client_secret_saved"], True)
+
+    def test_oidc_identity_uses_stable_subject_and_refreshes_role(self):
+        first = self.store.login_oidc("https://issuer.example/tenant", "subject-1", "person@example.com",
+                                      "Person Example", "admin")
+        old_version = first["auth_version"]
+        second = self.store.login_oidc("https://issuer.example/tenant", "subject-1", "new-name@example.com",
+                                       "Person New", "operator")
+        self.assertEqual(second["username"], first["username"])
+        self.assertEqual(second["role"], "operator")
+        self.assertEqual(second["auth_version"], old_version + 1)
+        self.assertEqual(second["display_name"], "Person New")
+        self.store.add_user("admin", "admin-web-password")
+        collision = self.store.login_oidc("https://issuer.example/tenant", "subject-2", "admin",
+                                          "Admin Imitator", "operator")
+        self.assertNotEqual(collision["username"], "admin")
+        self.assertEqual(self.store.user("admin")["role"], "admin")
+
+
+    def test_group_mapping_requires_authorized_group_and_rejects_overage(self):
+        config = validate_oidc_config("https://login.microsoftonline.com/tenant/v2.0", "client-id",
+                                      "admin-group\nshared", "operator-group")
+        self.assertEqual(role_from_claims({"groups": ["operator-group"]}, config), "operator")
+        self.assertEqual(role_from_claims({"groups": ["shared"]}, config), "admin")
+        for claims in ({"groups": ["unmapped"]}, {"_claim_names": {"groups": "src"}}, {"hasgroups": True}, {}):
+            with self.subTest(claims=claims), self.assertRaises(OIDCLoginError):
+                role_from_claims(claims, config)
+
+    def test_oidc_client_uses_tenant_discovery_and_pkce(self):
+        config = validate_oidc_config("https://login.microsoftonline.com/tenant/v2.0", "client-id",
+                                      "admin-group", "operator-group")
+        client = create_oidc_client(config, "client-secret")
+        self.assertEqual(client.client_kwargs["code_challenge_method"], "S256")
+        self.assertEqual(client._server_metadata_url,
+                         "https://login.microsoftonline.com/tenant/v2.0/.well-known/openid-configuration")
+
+    def test_release_asset_names_and_cli_instructions_are_versioned_and_verified(self):
+        tag = "v1.2.3"
+        archive = f"cisco-dc-operations-{tag}.tar.gz"
+        release = release_details({"tag_name": tag, "name": "Stable release", "html_url": "https://github.com/example/release",
+                                   "assets": [{"name": archive}, {"name": archive + ".sha256"}]})
+        commands = install_instructions(release["tag"])
+        self.assertEqual(release["archive_name"], archive)
+        self.assertIn("sha256sum --check", commands)
+        self.assertIn("systemctl stop cisco-dc-automation.service", commands)
+        self.assertIn("install.sh", commands)
+        with self.assertRaises(ValueError):
+            release_details({"tag_name": "latest", "assets": []})
+        with self.assertRaises(ValueError):
+            release_details({"tag_name": tag, "assets": [{"name": archive}]})
+        with self.assertRaises(ValueError):
+            install_instructions("main")
+
+    def test_update_checker_handles_no_releases_without_auth_or_secrets(self):
+        response = type("Response", (), {"status_code": 404})()
+        with patch("release_updates.requests.get", return_value=response) as get:
+            with self.assertRaisesRegex(ValueError, "No published releases"):
+                latest_release()
+        get.assert_called_once_with(RELEASES_API, headers={"Accept": "application/vnd.github+json"}, timeout=10.0)
 
     def test_only_admin_can_create_users_and_duplicates_do_not_reset_passwords(self):
         self.store.create_user("operator", "engineer", "engineer-password")
