@@ -172,6 +172,12 @@ Adapt the supplied proxy config for the selected port, certificate paths, and
 hostname:
 
 ```bash
+: "${APP_FQDN:?Set APP_FQDN to the hostname used in the browser}"
+: "${APP_PORT:?Set APP_PORT to 8443 for a shared Nginx host, or 443 for a dedicated host}"
+: "${TLS_CERT:?Set TLS_CERT to the certificate/full-chain path}"
+: "${TLS_KEY:?Set TLS_KEY to the matching private-key path}"
+[[ "$APP_PORT" == 443 || "$APP_PORT" == 8443 ]] || { echo "APP_PORT must be 443 or 8443" >&2; exit 1; }
+sudo test -r "$TLS_CERT" && sudo test -r "$TLS_KEY" || { echo "Nginx certificate/key path is unreadable" >&2; exit 1; }
 sed \
   -e "s|listen 443 ssl;|listen ${APP_PORT} ssl;|" \
   -e "s|server_name _;|server_name ${APP_FQDN};|" \
