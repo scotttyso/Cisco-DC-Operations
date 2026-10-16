@@ -298,15 +298,112 @@ state. Reset a lost WebUI password by rerunning step 4 for the existing username
 
 ## Updating and Rolling Back
 
-Administrators can check published versions from **Account settings → Check for
-software updates**. Follow the checksum-verified CLI instructions shown there;
-the WebUI does not install code or receive sudo rights. See
-[Releases and Updates](releasing.md) for the release workflow and prerequisites.
+You do **not** need to rebuild the server or appliance image. Download an
+application source bundle, extract it into a fresh staging directory, and rerun
+its installer while the application service is stopped. Do not extract directly
+over the installed application or replace its data directories. The WebUI does
+not install code or receive sudo rights.
 
-Schedule a maintenance window, finish jobs, and back up state/key and the installed
-`/opt/cisco-dc-automation` code/venv. Record the approved dependency set. Verify and
-extract the new source bundle, stop the app, run its `install.sh`, then repeat
-`pip check`, import checks, and HTTPS smoke tests before returning it to service.
+**The bundle must contain the changes you want.** Editing a development checkout
+does not update an already-published GitHub release. For a versioned deployment,
+publish a new release containing those commits using
+[the release procedure](releasing.md). Alternatively, package the current
+checkout as described below.
+
+1. Finish active automation jobs and schedule a short UI outage. Record the
+   installed version with `cat /opt/cisco-dc-automation/VERSION`. Retain its
+   original source bundle and back up the installed `/opt/cisco-dc-automation`
+   code/venv for recovery.
+2. Obtain the new source archive through either method:
+
+   **Published release:** open **Account settings → Check for software updates**
+   as an administrator for the exact release download commands, or run the
+   following on the bare-metal server. Replace the example tag with the actual
+   published release containing your changes:
+
+   ```bash
+   set -euo pipefail
+   RELEASE_TAG=v0.1.1  # Example only; this release must exist before downloading.
+   ARCHIVE="cisco-dc-operations-${RELEASE_TAG}.tar.gz"
+   BASE_URL="https://github.com/scotttyso/Cisco-DC-Operations/releases/download/${RELEASE_TAG}"
+   WORK_DIR=$(mktemp -d "$HOME/cisco-dc-update.XXXXXX")
+   cd "$WORK_DIR"
+   curl --fail --location --output "$ARCHIVE" "$BASE_URL/$ARCHIVE"
+   curl --fail --location --output "$ARCHIVE.sha256" "$BASE_URL/$ARCHIVE.sha256"
+   sha256sum --check "$ARCHIVE.sha256"
+   mkdir source
+   tar -xzf "$ARCHIVE" -C source
+   ```
+
+   **Unreleased checkout:** on the development machine, from the
+   Cisco-DC-Operations repository root, create the allowlisted bundle:
+
+   ```bash
+   python3 automation-appliance/scripts/package_source.py /tmp/cisco-dc-operations-source.tar.gz
+   cd /tmp
+   sha256sum cisco-dc-operations-source.tar.gz > cisco-dc-operations-source.tar.gz.sha256
+   ```
+
+   Transfer both files through your approved secure channel. On the bare-metal
+   server, verify and extract them into a fresh directory:
+
+   ```bash
+   set -euo pipefail
+   WORK_DIR=$(mktemp -d "$HOME/cisco-dc-update.XXXXXX")
+   cd /path/to/transferred-files
+   sha256sum --check cisco-dc-operations-source.tar.gz.sha256
+   mkdir "$WORK_DIR/source"
+   tar -xzf cisco-dc-operations-source.tar.gz -C "$WORK_DIR/source"
+   ```
+
+   Verify the source/checksum provenance through a trusted channel. An
+   unreleased bundle includes current checkout edits but retains that checkout's
+   `VERSION`; it is not a new published release.
+
+3. In the same server shell, stop the service and create private backups of
+   application state and the vault key **separately**:
+
+   ```bash
+   sudo systemctl stop cisco-dc-automation.service
+   BACKUP_DIR=$(sudo mktemp -d /var/backups/cisco-dc-automation-update.XXXXXX)
+   sudo tar -czf "$BACKUP_DIR/state.tar.gz" -C /var/lib cisco-dc-automation
+   sudo tar -czf "$BACKUP_DIR/vault-key.tar.gz" -C /var/lib cisco-dc-automation-key
+   printf 'Backup directory: %s\n' "$BACKUP_DIR"
+   ```
+
+   Securely retain these backups separately under your backup policy. Also
+   preserve any custom systemd settings, `/etc/cisco-dc-automation/service.env`,
+   Nginx configuration, and TLS certificates/keys. These commands assume the
+   standard installation paths; adapt them if your service uses custom paths.
+   Losing or regenerating the vault key makes saved credentials unreadable.
+
+4. Install and validate the new application, then start the service:
+
+   ```bash
+   sudo bash "$WORK_DIR/source/automation-appliance/install.sh"
+   sudo /opt/cisco-dc-automation/.venv/bin/python -m pip check
+   (
+     cd /opt/cisco-dc-automation
+     sudo .venv/bin/python -c 'import automation_ui; print("Application imports OK")'
+   )
+   sudo systemctl start cisco-dc-automation.service
+   sudo systemctl --no-pager --full status cisco-dc-automation.service
+   ```
+
+   If installation or validation fails, leave the service stopped and resolve
+   the failure before proceeding. Inspect startup errors with
+   `sudo journalctl -u cisco-dc-automation.service -n 100 --no-pager`.
+
+The installer replaces application code, bundled NX-OS scripts, dependencies,
+and the supplied systemd unit. Use systemd drop-ins for local unit overrides.
+It preserves `/var/lib/cisco-dc-automation` and
+`/var/lib/cisco-dc-automation-key`; it does not replace Nginx/TLS configuration.
+Do not recreate WebUI users or regenerate the vault key during an update.
+**Never run Packer provisioning, cleanup, or first-boot scripts as an update.**
+
+Refresh the existing HTTPS URL, sign in again if prompted, and verify inventory,
+saved credentials, and the new UI controls. Run a read-only plan before applying
+automation.
 
 Requirements use version ranges rather than a full release lock. Archive an
 approved source/package set for repeatability. Rollback may require both the

@@ -34,6 +34,10 @@ hop only. The HTTP development URL above is not the customer deployment.
 See [docs/releasing.md](docs/releasing.md) for versioned releases and the
 administrator WebUI update-check/CLI-install workflow.
 
+For existing bare-metal installations, follow
+[Updating and Rolling Back](docs/deploy_ubuntu_baremetal.md#updating-and-rolling-back)
+for source-bundle downloads, backups, installation, and validation.
+
 ### Navigation
 
 Top-level tabs are alphabetical: **APICs**, **Nexus Dashboards**, **Operations**,
