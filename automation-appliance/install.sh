@@ -6,6 +6,9 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
+# Code and dependencies must remain readable by the unprivileged service.
+umask 022
+
 PROJECT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPTS_DIR=${PROJECT_DIR}/nxos-scripts
 APP_DIR=/opt/cisco-dc-automation
@@ -35,6 +38,7 @@ install -m 0755 "${PROJECT_DIR}/automation-appliance/update.py" /usr/local/sbin/
 install -m 0644 "${SCRIPTS_DIR}/nd_stage_nexus_updates.py" "${SCRIPTS_DIR}/nxos_bootflash_stage.py" "${APP_DIR}/nxos-scripts/"
 python3 -m venv "${APP_DIR}/.venv"
 "${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
+chmod -R a+rX "${APP_DIR}/.venv"
 install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700 /var/lib/cisco-dc-automation /var/lib/cisco-dc-automation-key
 install -m 0644 "${PROJECT_DIR}/automation-appliance/cisco-dc-automation.service" /etc/systemd/system/
 systemctl daemon-reload

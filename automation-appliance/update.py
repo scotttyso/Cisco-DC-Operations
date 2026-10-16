@@ -195,7 +195,7 @@ def install_update(source: Path, backup: Path) -> None:
         run("bash", str(source / "automation-appliance/install.sh"))
         python = str(APP / ".venv/bin/python")
         run(python, "-m", "pip", "check")
-        run(python, "-c",
+        run("runuser", "-u", "cisco-dc-automation", "--", python, "-c",
             "import os; os.chdir('/opt/cisco-dc-automation'); "
             "import automation_ui; print('Application imports OK')")
         run("systemctl", "start", SERVICE)

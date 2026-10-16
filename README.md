@@ -291,8 +291,12 @@ can be downloaded after a job finishes.
 
 Both staging implementations are bundled in this repository's `nxos-scripts/`
 directory. No sibling checkout is required. `DC_NXOS_SCRIPTS_DIR` can optionally
-override that directory. The ND integration uses its own `dc_upgrade_` custom-check
-namespace and requires an explicitly supplied ND address.
+override that directory. The ND integration uses the `nxos_` custom-check
+namespace and requires an explicitly supplied ND address. It creates
+`nxos_mac_address` with `show mac address dynamic | sort`; an existing
+`mac_address` definition is not required. Existing default or previous-prefix
+checks are not renamed or deleted. All selected custom checks use a 360-second
+post-update delay.
 YAML may not contain passwords, vault paths, or custom SSH options. The existing
 bootflash script's host-key acceptance and legacy crypto fallback remain in effect;
 review those policies before using it in production.

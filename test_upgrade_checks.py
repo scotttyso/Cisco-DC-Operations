@@ -339,7 +339,7 @@ root = Path(sys.argv[1])
 job = NXJob('nd', root / 'job', {}, {'password': 'synthetic'})
 assert job.script.parent == root / 'nxos-scripts'
 settings = runpy.run_path(str(job.script))
-assert settings['CUSTOM_CHECK_PREFIX'] == 'dc_upgrade_'
+assert settings['CUSTOM_CHECK_PREFIX'] == 'nxos_'
 arguments = settings['parse_args'](['--nd-url', 'https://nd.example.com'])
 assert arguments.nd_url == 'https://nd.example.com'
 """
@@ -408,6 +408,46 @@ assert arguments.nd_url == 'https://nd.example.com'
 class UpdaterTests(unittest.TestCase):
     def setUp(self):
         self.updater = appliance_module("dc_updater", "update.py")
+
+    def test_installer_keeps_dependencies_readable_under_private_updater_umask(self):
+        script = (Path(__file__).parent / "automation-appliance/install.sh").read_text()
+        mask = next(line for line in script.splitlines() if line.startswith("umask "))
+        repair = next(line for line in script.splitlines() if line.startswith("chmod -R "))
+        self.assertLess(script.index(mask), script.index('python3 -m venv'))
+        self.assertGreater(script.index(repair), script.index('-m pip install'))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            venv = app / ".venv"
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)],
+                           check=True, umask=0o077)
+            packages = next((venv / "lib").glob("python*/site-packages"))
+            self.assertEqual(packages.stat().st_mode & 0o777, 0o700)
+            private_package = packages / "authlib/integrations"
+            private_package.mkdir(parents=True, mode=0o700)
+            module = private_package / "__init__.py"
+            module.write_text("")
+            module.chmod(0o600)
+            state = app / "state"
+            state.mkdir(mode=0o700)
+            key = state / "vault.key"
+            key.write_text("synthetic")
+            key.chmod(0o600)
+            environment = {**os.environ, "APP_DIR": str(app)}
+            subprocess.run(["bash", "-eu", "-c", mask + "\n" + repair],
+                           env=environment, check=True, umask=0o077)
+            self.assertEqual(packages.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(private_package.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(module.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            fresh = app / "fresh"
+            subprocess.run(["bash", "-eu", "-c",
+                            mask + '\n"$PYTHON" -m venv --without-pip "$FRESH"'],
+                           env={**environment, "PYTHON": sys.executable, "FRESH": str(fresh)},
+                           check=True, umask=0o077)
+            self.assertEqual(next((fresh / "lib").glob("python*/site-packages")).stat().st_mode & 0o777,
+                             0o755)
 
     def test_bundled_source_extracts_and_checksums_are_verified(self):
         packaging = appliance_module("dc_package_update", "scripts/package_source.py")
@@ -508,6 +548,7 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(events[2], ("bash", "/source/automation-appliance/install.sh"))
         self.assertIn("-m", events[3])
         self.assertIn("check", events[3])
+        self.assertEqual(events[4][:4], ("runuser", "-u", "cisco-dc-automation", "--"))
         self.assertEqual(events[-2], ("systemctl", "start", self.updater.SERVICE))
         self.assertEqual(events[-1], ("health",))
 
@@ -685,6 +726,61 @@ class UpdaterTests(unittest.TestCase):
 
 
 class NXJobTests(unittest.TestCase):
+    def test_bundled_mac_check_is_created_without_existing_definition(self):
+        import copy
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        # Include every old source except mac_address to reproduce the reported ND catalog.
+        sources = [
+            {"reportCheckName": name, "checkType": "basic", "cliCommand": "show module",
+             "postUpdateDelay": 0, "advancedChecks": [{"checkMustContains": ["preserve"]}]}
+            for name in (*helpers["REQUESTED_CHECK_NAMES"], "mac_address")
+            if name != "mac_address"
+        ]
+        original = copy.deepcopy(sources)
+        catalog = {item["reportCheckName"]: item for item in sources}
+
+        def request(method, path, payload=None):
+            if method == "GET" and path == helpers["REPORT_CHECKS"]:
+                return {"updateChecks": copy.deepcopy(list(catalog.values()))}
+            if method == "GET":
+                return copy.deepcopy(catalog[path.rsplit("/", 1)[-1]])
+            if method == "POST":
+                for check in payload["updateChecks"]:
+                    catalog[check["reportCheckName"]] = copy.deepcopy(check)
+                return {}
+            if method == "PUT":
+                catalog[payload["reportCheckName"]] = copy.deepcopy(payload)
+                return {}
+            self.fail(f"Unexpected ND call: {method} {path}")
+
+        client = MagicMock()
+        client.request.side_effect = request
+        current, checks = helpers["load_check_catalog"](client)
+        self.assertEqual(len(checks), 21)
+        self.assertTrue(all(check["reportCheckName"].startswith("nxos_") for check in checks))
+        mac = next(check for check in checks if check["reportCheckName"] == "nxos_mac_address")
+        self.assertEqual(mac["cliCommand"], "show mac address dynamic | sort")
+        self.assertEqual(mac["advancedChecks"], [])
+        self.assertEqual(mac["postUpdateDelay"], 360)
+        self.assertEqual(mac["checkType"], "custom")
+        client.request.assert_called_once_with("GET", helpers["REPORT_CHECKS"])
+        helpers["ensure_check_catalog"](client, current, checks)
+        self.assertEqual([catalog[check["reportCheckName"]] for check in original], original)
+        self.assertEqual(catalog["nxos_mac_address"], mac)
+        client.request.reset_mock()
+        current, checks = helpers["load_check_catalog"](client)
+        helpers["ensure_check_catalog"](client, current, checks)
+        self.assertTrue(all(call.args[0] == "GET" for call in client.request.call_args_list))
+        existing = dict(original[0], reportCheckName="mac_address", cliCommand="custom command")
+        catalog["mac_address"] = copy.deepcopy(existing)
+        current, checks = helpers["load_check_catalog"](client)
+        helpers["ensure_check_catalog"](client, current, checks)
+        self.assertEqual(catalog["mac_address"], existing)
+        del catalog["OSPF_state"]
+        with self.assertRaisesRegex(ValueError, "OSPF_state"):
+            helpers["load_check_catalog"](client)
+
     def test_upgrade_rules_editor_validates_and_replaces_defaults(self):
         from automation_ui import nd_upgrade_rules_yaml
         from nd_interfaces import nd_helpers

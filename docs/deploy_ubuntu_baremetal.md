@@ -337,7 +337,8 @@ The updater:
    new `/var/backups/cisco-dc-automation-update-*` directory: application
    code/venv, state, vault key, and existing Nginx/application/systemd config
    plus the installed updater. State and key are separate files.
-5. Runs the bundle's installer, `pip check`, an application import check, and
+5. Runs the bundle's installer, `pip check`, an application import check as the
+   unprivileged service account, and
    service startup. It waits up to 60 seconds for an active service and an
    HTTP 200 from the loopback login endpoint.
 
@@ -508,6 +509,31 @@ No change to the Packer VM's OS is needed for HTTPS.
 | Device TLS errors | Install the approved CA trust; review Python/Requests CA configuration without globally disabling verification. |
 | Jump/legacy SSH errors | Confirm rescue-user access, ND-to-switch reachability, domain-qualified login, and per-workflow crypto policy. |
 | Package installation fails | Check Ubuntu Python, package mirror, compatible wheels, and dependency bounds before enabling service. |
+
+### Service Import Failures After a v0.1.2 Updater Run
+
+The v0.1.2 updater used a private `077` umask that its installer inherited.
+New virtual-environment files could become root-only, allowing the root import
+check to pass while the service account failed with errors such as
+`ModuleNotFoundError: No module named 'authlib.integrations'`.
+The updated installer uses `022` for application code and repairs readability
+within the venv; the updater now checks imports as the service account.
+
+For an affected standard installation, repair only the dependency environment,
+then verify imports as the service account before starting:
+
+```bash
+sudo chmod -R a+rX /opt/cisco-dc-automation/.venv
+sudo -u cisco-dc-automation /opt/cisco-dc-automation/.venv/bin/python -c \
+  'import os; os.chdir("/opt/cisco-dc-automation"); import automation_ui; print("Service imports OK")'
+sudo systemctl start cisco-dc-automation.service
+sudo systemctl --no-pager --full status cisco-dc-automation.service
+```
+
+Run each command separately and stop if the import check fails; inspect the
+service journal rather than repeatedly reinstalling. Do not apply permission
+changes to the state/key directories under `/var/lib`; they must stay private.
+If permissions were not the cause, retain the full traceback for diagnosis.
 
 This guide does not certify a real Ubuntu install, VM boot, or customer device
 workflow. Complete the acceptance checks in the target environment before rollout.

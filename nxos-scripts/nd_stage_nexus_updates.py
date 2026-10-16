@@ -250,7 +250,6 @@ REQUESTED_CHECK_NAMES = (
     "Modules_health_and_backup_power",
     "Interface_status",
     "OSPF_stability",
-    "mac_address",
     "vPC_sticky_bit",
     "Dual_supervisor_redundancy",
     "NVRAM_log_messages",
@@ -262,10 +261,11 @@ REQUESTED_CHECK_NAMES = (
 NEW_CHECKS = {
     "Running_config": "show running-config",
     "Default_route": "show ip route 0.0.0.0 vrf all",
+    "mac_address": "show mac address dynamic | sort",
 }
 NEW_CHECK_TEMPLATE = "Interface_status"
 POST_UPDATE_DELAY = 360
-CUSTOM_CHECK_PREFIX = "dc_upgrade_"
+CUSTOM_CHECK_PREFIX = "nxos_"
 GROUP_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,48}")
 
 
@@ -765,7 +765,7 @@ def main() -> int:
             return 0
 
         print(
-            f"Preparing dc_upgrade_ custom checks with {POST_UPDATE_DELAY}-second delays; "
+            f"Preparing {CUSTOM_CHECK_PREFIX} custom checks with {POST_UPDATE_DELAY}-second delays; "
             "default checks remain unchanged"
         )
         checks = ensure_check_catalog(client, current_checks, checks)
