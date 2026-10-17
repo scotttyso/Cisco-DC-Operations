@@ -726,6 +726,164 @@ class UpdaterTests(unittest.TestCase):
 
 
 class NXJobTests(unittest.TestCase):
+    def test_parallel_submission_reaches_ten_with_isolated_sessions_and_reports_partial_failure(self):
+        import threading
+        import requests
+        helpers, checks, images, switch = self.split_fixture()
+        client = object.__new__(helpers["NexusDashboard"])
+        client.url = "https://nd.example.test"
+        client.request_timeout = 60
+        client.session = requests.Session()
+        client.session.verify = False
+        client.session.cookies.set("AuthCookie", "synthetic")
+        barrier = threading.Barrier(10, timeout=5)
+        lock = threading.Lock()
+        sessions, calls = [], []
+        active = peak = 0
+
+        def apply(worker, plan, selected_checks, additions, pre_report):
+            nonlocal active, peak
+            with lock:
+                sessions.append(worker.session)
+                calls.append(plan.group_name)
+                active += 1
+                peak = max(peak, active)
+            self.assertIsNot(worker.session, client.session)
+            self.assertEqual(worker.session.cookies.get("AuthCookie"), "synthetic")
+            self.assertFalse(worker.session.verify)
+            worker.session.cookies.set("worker", plan.group_name)
+            worker.session.close = MagicMock()
+            try:
+                barrier.wait()
+                if plan.group_name == "g0":
+                    raise RuntimeError("synthetic failure")
+            finally:
+                with lock:
+                    active -= 1
+
+        plans = [helpers["make_plan"](f"g{i}", [switch(str(i))], checks, images) for i in range(20)]
+        additions = {(plan.fabric, plan.group_name): plan.serials for plan in plans}
+        with patch.dict(helpers["submit_plans"].__globals__, {"apply_plan": apply}), \
+                self.assertRaisesRegex(RuntimeError, "other groups may have been staged.*g0"):
+            helpers["submit_plans"](client, plans, checks, additions, False, 10, {})
+        self.assertEqual(peak, 10)
+        self.assertEqual(len(calls), 20)
+        self.assertEqual(len({id(session) for session in sessions}), 20)
+        self.assertNotIn("worker", client.session.cookies)
+        for session in sessions:
+            session.close.assert_called_once()
+        barrier = threading.Barrier(1, timeout=5)
+        sessions, calls = [], []
+        active = peak = 0
+        with patch.dict(helpers["submit_plans"].__globals__, {"apply_plan": apply}), \
+                self.assertRaisesRegex(RuntimeError, "other groups may have been staged.*g0"):
+            helpers["submit_plans"](client, plans, checks, additions, False, 1, {})
+        self.assertEqual(peak, 1)
+        self.assertEqual(len(calls), 20)
+        for session in sessions:
+            session.close.assert_called_once()
+        client.session.close()
+
+    def test_parallel_setting_validation_and_existing_selection_schema(self):
+        from nxos_jobs import nd_switch_selection
+        helpers, _, _, _ = self.split_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "input.yaml"
+            for value in (0, 11, True, 1.5, "10"):
+                config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"},
+                                                 "parallel_groups": value}))
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    helpers["parse_args"](["--config", str(config)])
+            config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"},
+                                             "parallel_groups": 1}))
+            self.assertEqual(helpers["parse_args"](["--config", str(config)]).parallel_groups, 1)
+            self.assertEqual(helpers["parse_args"](["--config", str(config), "--parallel-groups", "10"]).parallel_groups, 10)
+            groups = [{"fabric": fabric, "name": "same", "members": [fabric + "-s"], "hosts": "new, new"}
+                      for fabric in ("F1", "F2")]
+            selection = nd_switch_selection("existing", groups=groups)
+            self.assertEqual(selection["existing_groups"][0]["add_hosts"], ["new"])
+            config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"}, **selection}))
+            self.assertEqual(len(helpers["parse_args"](["--config", str(config)]).existing_groups), 2)
+            with self.assertRaisesRegex(ValueError, "at least one existing"):
+                nd_switch_selection("existing")
+
+    def test_existing_group_membership_is_preserved_and_revalidated(self):
+        helpers, checks, images, switch = self.split_fixture()
+        switches = [switch("s"), switch("new"), switch("other", fabric="F2")]
+        record = {"updateGroupName": "leaf", "updateGroupSwitches": ["s"]}
+        entry = {"fabric": "F1", "name": "leaf", "members": ["s"], "add_hosts": ["new", "s"]}
+        client = MagicMock()
+        client.request.return_value = record
+        inventory_groups = helpers["load_existing_groups"](client, switches)
+        self.assertEqual(inventory_groups, [
+            {"fabric": fabric, "name": "leaf", "members": ["s"]} for fabric in ("F1", "F2")])
+        self.assertEqual([call.args[1] for call in client.request.call_args_list],
+                         [helpers["fabric_path"](fabric, "updateGroups") for fabric in ("F1", "F2")])
+        groups, snapshots = helpers["resolve_existing_groups"](client, switches, [entry])
+        self.assertEqual([item.serial for item in groups[0][1]], ["s", "new"])
+        self.assertEqual(snapshots, {("F1", "leaf"): ["s"]})
+        with self.assertRaisesRegex(ValueError, "Membership changed"):
+            helpers["resolve_existing_groups"](client, switches, [{**entry, "members": []}])
+        with self.assertRaisesRegex(ValueError, "must belong to F1"):
+            helpers["resolve_existing_groups"](client, switches, [{**entry, "add_hosts": ["other"]}])
+        with self.assertRaisesRegex(ValueError, "invalid switch membership"):
+            helpers["group_member_ids"]({"updateGroupSwitches": [{"serial": "s"}]})
+        plan = helpers["make_plan"](*groups[0], checks, images)
+        client.fork.return_value.request.return_value = {**record, "updateGroupSwitches": ["s", "late"]}
+        apply = MagicMock()
+        with patch.dict(helpers["submit_plans"].__globals__, {"apply_plan": apply}), \
+                self.assertRaisesRegex(RuntimeError, "submissions failed"):
+            helpers["submit_plans"](client, [plan], checks, {("F1", "leaf"): ["new"]}, False, 1, snapshots)
+        apply.assert_not_called()
+        client.fork.return_value.session.close.assert_called_once()
+
+    def test_existing_groups_cli_preserves_members_and_refuses_moves_or_splitting(self):
+        helpers, checks, images, switch = self.split_fixture()
+        for apply, conflict, mixed, stale in ((False, False, False, False), (True, False, False, False),
+                                             (True, True, False, False), (True, False, True, False),
+                                             (True, False, False, True)):
+            with self.subTest(apply=apply, conflict=conflict, mixed=mixed, stale=stale), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "input.yaml"
+                selection = {"fabric": "F1", "name": "leaf", "members": ["s"], "add_hosts": ["new"]}
+                config.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"},
+                                                 "existing_groups": [selection]}))
+                record = {"updateGroupName": "leaf", "updateGroupSwitches": ["s"]}
+                reads = 0
+
+                def request(method, path, payload=None):
+                    nonlocal reads
+                    self.assertEqual(method, "GET")
+                    if path == helpers["SWITCHES"]:
+                        return []
+                    if path == helpers["IMAGES"]:
+                        return images
+                    if path == helpers["group_path"]("F1", "leaf"):
+                        reads += 1
+                        return {**record, "updateGroupSwitches": ["s", "late"]} if stale and reads > 1 else record
+                    return [record] + ([{"updateGroupName": "other", "updateGroupSwitches": ["new"]}] if conflict else [])
+
+                client = MagicMock()
+                client.request.side_effect = request
+                client.fork.return_value = client
+                apply_plan = MagicMock()
+                ensure = MagicMock(return_value=checks)
+                argv = ["script", "--config", str(config)] + (["--apply"] if apply else [])
+                with patch.object(sys, "argv", argv), patch.dict(os.environ, {"NEXUS_PASSWORD": "synthetic"}), \
+                        patch.dict(helpers["main"].__globals__, {
+                            "NexusDashboard": MagicMock(return_value=client),
+                            "load_switches": MagicMock(return_value=[switch("s"), switch("new", vpc=mixed)]),
+                            "load_check_catalog": MagicMock(return_value=({}, checks)),
+                            "ensure_check_catalog": ensure, "apply_plan": apply_plan,
+                        }):
+                    self.assertEqual(helpers["main"](), 1 if conflict or mixed or stale else 0)
+                if apply and not (conflict or mixed or stale):
+                    self.assertEqual(apply_plan.call_args.args[1].serials, ["s", "new"])
+                    self.assertEqual(apply_plan.call_args.args[3], ["new"])
+                else:
+                    apply_plan.assert_not_called()
+                if not apply or conflict or mixed:
+                    ensure.assert_not_called()
+
     def split_fixture(self):
         from nd_interfaces import nd_helpers
         helpers = nd_helpers()
@@ -824,10 +982,12 @@ class NXJobTests(unittest.TestCase):
                         }):
                     self.assertEqual(helpers["main"](), 1 if conflict else 0)
                 if apply and not conflict:
-                    self.assertEqual([call.args[1].group_name for call in apply_plan.call_args_list],
-                                     ["mixed", "mixed-vpc"])
-                    self.assertEqual([call.args[3] for call in apply_plan.call_args_list], [["s"], []])
-                    self.assertEqual([call.args[1].serials for call in apply_plan.call_args_list], [["s"], ["v"]])
+                    applied = {call.args[1].group_name: call for call in apply_plan.call_args_list}
+                    self.assertEqual(set(applied), {"mixed", "mixed-vpc"})
+                    self.assertEqual(applied["mixed"].args[3], ["s"])
+                    self.assertEqual(applied["mixed-vpc"].args[3], [])
+                    self.assertEqual(applied["mixed"].args[1].serials, ["s"])
+                    self.assertEqual(applied["mixed-vpc"].args[1].serials, ["v"])
                 else:
                     apply_plan.assert_not_called()
 
@@ -1027,6 +1187,38 @@ class NXJobTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 nd_upgrade_rules_yaml(text)
 
+    def test_legacy_i_train_target_passes_ui_cli_and_exact_image_selection(self):
+        from automation_ui import nd_image_mappings_yaml, nd_upgrade_rules_yaml
+        from nd_interfaces import nd_helpers
+        helpers = nd_helpers()
+        target = "7.0.3.I7.10"
+        name = "nxos.7.0.3.I7.10.bin"
+        rules = nd_upgrade_rules_yaml(
+            f"upgrade_rules:\n- models: ['*']\n  source_version: '7.0'\n  target_version: '{target}'")
+        mappings = nd_image_mappings_yaml(f"image_mappings:\n  '{target}': {name}")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.yaml"
+            path.write_text(yaml.safe_dump({"nexus_dashboard": {"host": "nd.example.test"}, **rules, **mappings}))
+            args = helpers["parse_args"](["--config", str(path)])
+        switch = helpers["Switch"]("S1", "dcmepibsw002", "", "N9K-C93180YC-EX",
+                                   "7.0(3)I7(3)", "n9k", "", "", "F1")
+        self.assertEqual(helpers["target_for"](switch, args.upgrade_rules), target)
+        image = {"imageName": name, "platform": "n9k", "imagePresent": "Verified", "imageSubType": "nx-os"}
+        other = {**image, "imageName": "nxos.7.0.3.I7.3.bin", "releaseVersion": "7.0.3.I7.3"}
+        for release in (target, "7.0(3)I7(10)", None):
+            catalog = [other, {**image, **({"releaseVersion": release} if release else {})}]
+            with self.subTest(release=release):
+                plan = helpers["make_plan"]("legacy", [switch], [], catalog, args.upgrade_rules, args.image_mappings)
+                self.assertEqual(plan.image_name, name)
+                self.assertEqual(plan.target_version, target)
+                with self.assertRaisesRegex(ValueError, "found none"):
+                    helpers["select_image"]([other], switch, target, other["imageName"])
+        for invalid in ("7.0.3.I7", "7.0.3.I.10", "7.0.3.foo.10", "7.0.3.I7.10/evil", "7.0.3..I7.10"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                helpers["load_upgrade_rules"]([{"models": ["*"], "source_version": "7.0", "target_version": invalid}])
+            with self.subTest(mapping=invalid), self.assertRaises(ValueError):
+                helpers["load_image_mappings"]({invalid: name})
+
     def test_named_group_selection_matches_the_bundled_script(self):
         selection = nd_switch_selection("named", groups=[
             {"name": "leaf-fx-10_6_4", "hosts": "leaf101, leaf102\nleaf101"},
@@ -1085,6 +1277,84 @@ class NXJobTests(unittest.TestCase):
 
 
 class NXProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_group_ui_loads_members_additions_and_invalidates_dashboard(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+
+        async def io_bound(function, *args):
+            return function(*args)
+
+        async def click(button):
+            handler = next(listener.handler for listener in button._event_listeners.values()
+                           if listener.type == "click")
+            await inspect.getclosurevars(handler).nonlocals["callback"]()
+
+        service = MagicMock()
+        service.update_groups.return_value = (
+            [{"fabric": fabric, "name": "leaf", "members": [fabric + "-serial"]} for fabric in ("F1", "F2")],
+            [{"fabric": fabric, "name": fabric + "-switch", "serial": fabric + "-serial"} for fabric in ("F1", "F2")],
+        )
+        job = MagicMock(cancelled=False)
+        job.run = AsyncMock(return_value=0)
+        storage = {}
+        with tempfile.TemporaryDirectory() as directory, Client(ui.page("/_nd_existing_test")), \
+                patch.object(web, "app", SimpleNamespace(storage=SimpleNamespace(user=storage))), \
+                patch.object(web, "owner", return_value="operator"), \
+                patch.object(web, "dashboard_picker",
+                             side_effect=lambda label: ui.select({"nd": "ND", "nd2": "ND2"}, value="nd")), \
+                patch.object(web, "STORE", create=True) as store, \
+                patch.object(web, "saved_credentials", side_effect=lambda *args: {
+                    "username": "netops", "domain": "local", "password": "synthetic"}), \
+                patch.object(web, "InterfaceDescriptions", return_value=service) as client_type, \
+                patch.object(web.run, "io_bound", side_effect=io_bound), \
+                patch.object(web, "output_directory", return_value=Path(directory)), \
+                patch.object(web, "NXJob", return_value=job) as factory, \
+                patch.object(web, "confirm", new=AsyncMock(return_value=True)), \
+                patch.object(web, "notify_error") as error:
+            store.dashboards.return_value = [
+                {"id": item, "address": item + ".example.test", "verify_tls": True} for item in ("nd", "nd2")]
+            with ui.column() as container:
+                web.nxos_panel("nd")
+            elements = list(container.descendants())
+            mode = next(item for item in elements if getattr(item, "options", {}).get("existing") == "Existing update groups")
+            mode.value = "existing"
+            load = next(item for item in elements if item._props.get("label") == "Load existing update groups")
+            start = next(item for item in elements if item._props.get("label") == "Run staging")
+            await click(start)
+            factory.assert_not_called()
+            error.assert_called_once()
+            error.reset_mock()
+            await click(load)
+            client_type.assert_called_once_with("https://nd.example.test", "netops", "synthetic", True, "local")
+            service.close.assert_called_once()
+            elements = list(container.descendants())
+            for fabric in ("F1", "F2"):
+                next(item for item in elements if getattr(item, "text", "") == f"{fabric} / leaf").value = True
+                self.assertTrue(any(getattr(item, "text", "") == f"Current members: {fabric}-switch [{fabric}-serial]"
+                                    for item in elements))
+            additions = [item for item in elements if item._props.get("label") == "Additional switches"]
+            additions[0].value = "extra, extra"
+            for apply in (False, True):
+                next(item for item in elements if getattr(item, "text", "") == "Apply staging changes").value = apply
+                await click(start)
+                error.assert_not_called()
+                config = factory.call_args.args[2]
+                self.assertNotIn("update_groups", config)
+                self.assertEqual(config["parallel_groups"], 10)
+                self.assertEqual(config["existing_groups"], [
+                    {"fabric": fabric, "name": "leaf", "members": [fabric + "-serial"],
+                     "add_hosts": ["extra"] if fabric == "F1" else []} for fabric in ("F1", "F2")])
+                self.assertEqual(factory.call_args.kwargs["apply"], apply)
+            factory.reset_mock()
+            profile = next(item for item in elements if getattr(item, "options", {}) == {"nd": "ND", "nd2": "ND2"})
+            profile.value = "nd2"
+            await click(start)
+            factory.assert_not_called()
+            error.assert_called_once()
+            self.assertFalse(any(item._props.get("label") == "Additional switches" for item in container.descendants()))
+            container.delete()
+
     async def test_nd_ui_passes_edited_rules_to_plan_and_apply(self):
         import automation_ui as web
         from nicegui import ui

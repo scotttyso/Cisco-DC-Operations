@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create Nexus Dashboard update groups (named multi-switch or per-switch) and stage NX-OS images."""
+"""Create or reuse Nexus Dashboard update groups and submit parallel NX-OS staging requests."""
 
 import argparse
 import copy
@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -22,6 +23,7 @@ import yaml
 
 
 API_PREFIX = "/api/v1"
+TARGET_VERSION_PATTERN = r"\d+(?:\.\d+)+(?:\.I\d+\.\d+)?"
 REPORT_CHECKS = "/manage/updateReports/reportChecks"
 SWITCHES = "/manage/fabricSoftware/switches"
 IMAGES = "/manage/fabricSoftware/images"
@@ -85,6 +87,17 @@ class Plan:
 
 
 class NexusDashboard:
+    def fork(self) -> "NexusDashboard":
+        """Give a group workflow its own HTTP session and authenticated cookie copy."""
+        client = object.__new__(type(self))
+        client.url = self.url
+        client.request_timeout = self.request_timeout
+        client.session = requests.Session()
+        client.session.verify = self.session.verify
+        client.session.headers.update(self.session.headers)
+        client.session.cookies.update(self.session.cookies)
+        return client
+
     def __init__(
         self,
         url: str,
@@ -215,7 +228,7 @@ def select_image(payload: Any, switch: Switch, target: str, image_name_override:
             continue
         image_version = field(item, "releaseVersion", "imageVersion")
         if not image_version:
-            match = re.search(r"\.(\d+(?:[.(]\d+\)?)+)", image_name)
+            match = re.search(r"\.(\d+(?:[.(]\d+\)?)+(?:\.?I\d+[.(]\d+\)?)?)", image_name)
             image_version = match[1] if match else ""
         platform = field(item, "platform").casefold()
         present = field(item, "imagePresent").casefold()
@@ -506,6 +519,100 @@ def group_path(fabric: str, group: str) -> str:
     return fabric_path(fabric, "updateGroups/{}".format(quote(group, safe="")))
 
 
+def group_member_ids(record: Dict[str, Any]) -> List[str]:
+    members = record.get("updateGroupSwitches")
+    if not isinstance(members, list) or any(not isinstance(item, str) or not item for item in members):
+        raise ValueError(f"ND group {field(record, 'updateGroupName')} has invalid switch membership")
+    if len(members) != len(set(members)):
+        raise ValueError("ND group contains duplicate switch IDs")
+    return members
+
+
+def load_existing_groups(client: NexusDashboard, switches: Sequence[Switch]) -> List[Dict[str, Any]]:
+    records = []
+    for fabric in sorted({switch.fabric for switch in switches}):
+        payload = client.request("GET", fabric_path(fabric, "updateGroups"))
+        seen = set()
+        for item in walk_records(payload):
+            name = field(item, "updateGroupName")
+            if not name:
+                continue
+            if name in seen:
+                raise ValueError(f"ND returned duplicate update group {fabric}/{name}")
+            seen.add(name)
+            records.append({"fabric": fabric, "name": name, "members": group_member_ids(item)})
+    return records
+
+
+def resolve_existing_groups(
+    client: NexusDashboard, switches: Sequence[Switch], selected: Sequence[Dict[str, Any]],
+) -> Tuple[List[Tuple[str, List[Switch]]], Dict[Tuple[str, str], List[str]]]:
+    groups = []
+    snapshots = {}
+    by_serial = {switch.serial: switch for switch in switches}
+    for entry in selected:
+        fabric, name = entry["fabric"], entry["name"]
+        record = client.request("GET", group_path(fabric, name))
+        if not isinstance(record, dict) or field(record, "updateGroupName") != name:
+            raise ValueError(f"Cannot verify existing group {fabric}/{name}")
+        current = group_member_ids(record)
+        if set(current) != set(entry["members"]):
+            raise ValueError(f"Membership changed for {fabric}/{name}; reload existing groups")
+        missing = [serial for serial in current if serial not in by_serial or by_serial[serial].fabric != fabric]
+        if missing:
+            raise ValueError(f"Cannot resolve members of {fabric}/{name}: {', '.join(missing)}")
+        members = [by_serial[serial] for serial in current]
+        additions = select_switches(switches, entry["add_hosts"]) if entry["add_hosts"] else []
+        if any(switch.fabric != fabric for switch in additions):
+            raise ValueError(f"Additional switches for {name} must belong to {fabric}")
+        members += [switch for switch in additions if switch.serial not in current]
+        if not members:
+            raise ValueError(f"Existing group {name} has no selected switches")
+        groups.append((name, members))
+        snapshots[(fabric, name)] = current
+    return groups, snapshots
+
+
+def submit_plans(
+    client: NexusDashboard, plans: Sequence[Plan], checks: Sequence[Dict[str, Any]],
+    attach_by_name: Dict[Tuple[str, str], Sequence[str]], pre_report: bool, workers: int,
+    snapshots: Dict[Tuple[str, str], List[str]],
+) -> None:
+    def submit(plan: Plan) -> None:
+        worker = client.fork()
+        try:
+            key = (plan.fabric, plan.group_name)
+            if key in snapshots:
+                record = worker.request("GET", group_path(*key))
+                if (not isinstance(record, dict) or field(record, "updateGroupName") != plan.group_name
+                        or set(group_member_ids(record)) != set(snapshots[key])):
+                    raise ValueError(f"Membership changed for {plan.group_name}; reload before applying")
+                payload = worker.request("GET", fabric_path(plan.fabric, "updateGroups"))
+                for other in walk_records(payload):
+                    name = field(other, "updateGroupName")
+                    if name and name != plan.group_name and set(group_member_ids(other)).intersection(attach_by_name[key]):
+                        raise ValueError(f"Cannot move switches from existing group {name} into {plan.group_name}")
+            apply_plan(worker, plan, checks, attach_by_name[key], pre_report)
+            print(f"Staging requested for update group {plan.group_name} ({len(plan.switches)} switches)", flush=True)
+        finally:
+            worker.session.close()
+
+    failures = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(submit, plan): plan for plan in plans}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except (requests.RequestException, RuntimeError, ValueError, OSError) as error:
+                plan = futures[future]
+                name = f"{plan.fabric}/{plan.group_name}"
+                failures.append(name)
+                print(f"ERROR: Group {name} failed: {error}", file=sys.stderr, flush=True)
+    if failures:
+        raise RuntimeError("Some group submissions failed (other groups may have been staged): "
+                           + ", ".join(sorted(failures)))
+
+
 def load_vault_password(vault_file: Path, password_file: Path) -> str:
     executable = shutil.which("ansible-vault")
     if executable is None:
@@ -608,8 +715,8 @@ def load_image_mappings(raw: Any) -> Dict[str, str]:
     if not isinstance(raw, dict):
         raise ValueError("image_mappings must be a mapping of quoted target versions to image filenames")
     for version, name in raw.items():
-        if not isinstance(version, str) or not re.fullmatch(r"\d+(?:\.\d+)+", version):
-            raise ValueError("image_mappings keys must be quoted dotted target versions, e.g. '9.3.16'")
+        if not isinstance(version, str) or not re.fullmatch(TARGET_VERSION_PATTERN, version):
+            raise ValueError("image_mappings keys must be quoted target versions, e.g. '9.3.16' or '7.0.3.I7.10'")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.()-]*\.bin", name):
             raise ValueError(f"image_mappings[{version!r}] must be an exact .bin filename, not a path")
     return dict(raw)
@@ -630,8 +737,10 @@ def load_upgrade_rules(raw: Any) -> Tuple[UpgradeRule, ...]:
             raise ValueError(f"{location}.models must be a nonempty list of model patterns")
         for key in ("source_version", "target_version"):
             value = rule[key]
-            if not isinstance(value, str) or not re.fullmatch(r"\d+(?:\.\d+)+", value):
-                raise ValueError(f"{location}.{key} must be a quoted dotted version, e.g. '10.6'")
+            pattern = TARGET_VERSION_PATTERN if key == "target_version" else r"\d+(?:\.\d+)+"
+            if not isinstance(value, str) or not re.fullmatch(pattern, value):
+                examples = "'10.6.4' or '7.0.3.I7.10'" if key == "target_version" else "'10.6'"
+                raise ValueError(f"{location}.{key} must be a quoted dotted version, e.g. {examples}")
         rules.append(UpgradeRule(tuple(model.strip() for model in models),
                                  rule["source_version"], rule["target_version"]))
     return tuple(rules)
@@ -641,6 +750,7 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
     settings = {}
     selectors = {}
     raw_groups = {}
+    args.existing_groups = []
     args.upgrade_rules = DEFAULT_UPGRADE_RULES
     args.image_mappings = {}
     if args.config:
@@ -651,10 +761,11 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("Input sheet must contain valid YAML") from None
         if not isinstance(document, dict):
             raise ValueError("Input sheet must be a YAML mapping")
-        if set(document) - {"nexus_dashboard", "switches", "update_groups", "upgrade_rules", "image_mappings"}:
+        if set(document) - {"nexus_dashboard", "switches", "update_groups", "upgrade_rules", "image_mappings",
+                            "existing_groups", "parallel_groups"}:
             raise ValueError(
                 "Input sheet accepts only nexus_dashboard, switches, update_groups, upgrade_rules, "
-                "and image_mappings sections"
+                "image_mappings, existing_groups, and parallel_groups sections"
             )
         if "upgrade_rules" in document:
             args.upgrade_rules = load_upgrade_rules(document["upgrade_rules"])
@@ -665,11 +776,39 @@ def apply_config(args: argparse.Namespace) -> argparse.Namespace:
         raw_groups = document.get("update_groups") or {}
         if not all(isinstance(value, dict) for value in (settings, selectors, raw_groups)):
             raise ValueError("nexus_dashboard, switches, and update_groups must be YAML mappings")
+        if "existing_groups" in document:
+            entries = document["existing_groups"]
+            if not isinstance(entries, list) or not entries:
+                raise ValueError("existing_groups must be a nonempty list")
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {"fabric", "name", "members", "add_hosts"}:
+                    raise ValueError("Each existing_groups entry requires fabric, name, members, add_hosts")
+                if any(not isinstance(entry[key], str) or not entry[key].strip() for key in ("fabric", "name")):
+                    raise ValueError("Existing group fabric and name must be nonempty strings")
+                if not GROUP_NAME_RE.fullmatch(entry["name"]):
+                    raise ValueError("Existing group name must meet the 48-character ND naming rules")
+                for key in ("members", "add_hosts"):
+                    if not isinstance(entry[key], list) or any(
+                        not isinstance(value, str) or not value.strip() for value in entry[key]
+                    ):
+                        raise ValueError(f"existing_groups.{key} must be a list of nonempty strings")
+                args.existing_groups.append(entry)
+            if len({(entry["fabric"], entry["name"]) for entry in entries}) != len(entries):
+                raise ValueError("Duplicate existing group selection")
+            if raw_groups or selectors.get("hosts") or args.device:
+                raise ValueError("existing_groups cannot be combined with other switch selection modes")
         if set(settings) - {
             "host", "username", "domain", "verify_ssl", "timeout", "password_env",
             "vault_file", "vault_password_file",
         } or set(selectors) - {"hosts"}:
             raise ValueError("Input sheet contains unsupported settings; plaintext passwords are not supported")
+        if args.parallel_groups is None:
+            args.parallel_groups = document.get("parallel_groups", 10)
+
+    if args.parallel_groups is None:
+        args.parallel_groups = 10
+    if isinstance(args.parallel_groups, bool) or not isinstance(args.parallel_groups, int) or not 1 <= args.parallel_groups <= 10:
+        raise ValueError("parallel_groups must be an integer from 1 to 10")
 
     defaults = {
         "nd_url": settings.get("host", ""),
@@ -739,6 +878,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Switch name, IP, or serial for a per-device group; repeatable; overrides YAML update_groups",
     )
     parser.add_argument("--apply", action="store_true", help="Create groups and stage images; default only plans")
+    parser.add_argument("--parallel-groups", type=int, help="Concurrent group API workflows, 1-10 (default: 10)")
     tls = parser.add_mutually_exclusive_group()
     tls.add_argument("--insecure", action="store_true", default=None, help="Skip TLS certificate verification")
     tls.add_argument("--verify-tls", action="store_false", dest="insecure", default=None, help="Verify TLS even if disabled in YAML")
@@ -766,6 +906,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    client = None
     try:
         if args.request_timeout <= 0:
             raise ValueError("--request-timeout must be greater than zero")
@@ -785,20 +926,26 @@ def main() -> int:
         switches = load_switches(client.request("GET", SWITCHES))
         if not switches:
             raise ValueError("ND returned no switches from /manage/fabricSoftware/switches")
-        if args.device or not args.update_groups:
+        snapshots = {}
+        if args.existing_groups:
+            groups, snapshots = resolve_existing_groups(client, switches, args.existing_groups)
+        elif args.device or not args.update_groups:
             groups = [(device_group_name(s), [s]) for s in select_switches(switches, args.device)]
         else:
             groups = [(name, select_switches(switches, hosts)) for name, hosts in args.update_groups]
-            serials = [switch.serial for _, members in groups for switch in members]
-            if len(set(serials)) != len(serials):
-                raise ValueError("A switch is listed in more than one update group")
+        serials = [switch.serial for _, members in groups for switch in members]
+        if len(set(serials)) != len(serials):
+            raise ValueError("A switch is listed in more than one update group")
         current_checks, checks = load_check_catalog(client)
         images = client.request("GET", IMAGES)
-        groups = split_update_groups(groups, checks, images, args.upgrade_rules, args.image_mappings)
+        if not args.existing_groups:
+            groups = split_update_groups(groups, checks, images, args.upgrade_rules, args.image_mappings)
         plans = []
         for name, members in groups:
             plan = make_plan(name, members, checks, images, args.upgrade_rules, args.image_mappings)
             if plan is None:
+                if args.existing_groups:
+                    raise ValueError(f"Existing group {name} is outside the configured N9K upgrade rules")
                 detail = ", ".join(f"{s.name} {s.model} {s.version}" for s in members)
                 print(f"Skipping {name}: {detail} outside the N9K upgrade rules")
                 continue
@@ -817,8 +964,9 @@ def main() -> int:
             }
         attach_by_name = {}
         for plan in plans:
+            key = (plan.fabric, plan.group_name)
             existing = existing_by_fabric[plan.fabric].get(plan.group_name)
-            attach_by_name[plan.group_name] = plan.serials
+            attach_by_name[key] = plan.serials
             if existing is not None:
                 member_ids = existing.get("updateGroupSwitches") or []
                 if not isinstance(member_ids, list):
@@ -828,8 +976,14 @@ def main() -> int:
                     raise ValueError(
                         f"Update group {plan.group_name} already contains other switches: {', '.join(others)}"
                     )
-                attach_by_name[plan.group_name] = [s for s in plan.serials if s not in member_ids]
+                attach_by_name[key] = [s for s in plan.serials if s not in member_ids]
                 print(f"Reusing existing update group {plan.group_name}")
+            if args.existing_groups:
+                if existing is None or set(group_member_ids(existing)) != set(snapshots[(plan.fabric, plan.group_name)]):
+                    raise ValueError(f"Existing group {plan.group_name} changed; reload before staging")
+                for other_name, other in existing_by_fabric[plan.fabric].items():
+                    if other_name != plan.group_name and set(group_member_ids(other)).intersection(attach_by_name[key]):
+                        raise ValueError(f"Cannot move switches from existing group {other_name} into {plan.group_name}")
 
         print("Planned staging:")
         for plan in plans:
@@ -851,14 +1005,18 @@ def main() -> int:
         plans = [make_plan(name, members, checks, images, args.upgrade_rules, args.image_mappings)
                  for name, members in groups]
         plans = [plan for plan in plans if plan is not None]
-        for plan in plans:
-            apply_plan(client, plan, checks, attach_by_name[plan.group_name], args.run_pre_report)
-            print(f"Staging requested for update group {plan.group_name} ({len(plan.switches)} switches)")
+        print(f"Submitting up to {args.parallel_groups} group workflows concurrently; "
+              "ND completion is not monitored.", flush=True)
+        submit_plans(client, plans, checks, attach_by_name, args.run_pre_report,
+                     args.parallel_groups, snapshots)
         print("Staging requests submitted. The NX-OS upgrade was not started.")
         return 0
     except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if client is not None:
+            client.session.close()
 
 
 if __name__ == "__main__":

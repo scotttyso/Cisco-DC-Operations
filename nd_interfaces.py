@@ -126,6 +126,14 @@ class InterfaceDescriptions:
         return [{"serial": switch.serial, "name": switch.name, "address": switch.address,
                  "fabric": switch.fabric} for switch in switches]
 
+    def update_groups(self) -> tuple[list[dict], list[dict]]:
+        helpers = nd_helpers()
+        switches = helpers["load_switches"](self.client.request("GET", helpers["SWITCHES"]))
+        groups = helpers["load_existing_groups"](self.client, switches)
+        inventory = [{"serial": switch.serial, "name": switch.name, "address": switch.address,
+                      "fabric": switch.fabric} for switch in switches]
+        return groups, inventory
+
     def interfaces(self, fabric: str, serial: str) -> list[dict]:
         payload = self.client.request("GET", interface_path(fabric, serial))
         grouped = {}

@@ -234,7 +234,7 @@ are unchanged. Authentication protection is per job, not a cross-job lockout gua
 ### NX-OS Upgrade Workflows
 
 - **NX-OS / ND staging** invokes `nd_stage_nexus_updates.py`. Select a saved dashboard
-  and choose **Named update groups** or **Per-switch groups**. Named groups have
+  and choose **Named update groups**, **Per-switch groups**, or **Existing update groups**. Named groups have
   an **Update group name** and a **Member switches** list; use **Add update group**
   for multiple groups, or the remove icon to discard one. Members accept names,
   IPs, or serials separated by commas, spaces, or newlines. Per-switch mode retains
@@ -243,11 +243,40 @@ are unchanged. Authentication protection is per job, not a cross-job lockout gua
   creates/reuses update groups, attaches checks, and requests staging; it does not
   start the NX-OS install.
 
+**Parallel update groups** defaults to **10** concurrent API submission workflows
+(range 1-10; use 1 for sequential submission). Each workflow configures one group,
+verifies its checks, optionally requests a pre-report, then requests staging.
+Custom checks are prepared once before the parallel work. Each workflow has an
+isolated authenticated HTTP session. Failures identify the affected groups and
+make the job fail; other groups may already have been staged. There is no automatic
+rollback. This limits concurrent submissions, **not** actively running ND jobs;
+the script does not wait for ND completion or start NX-OS installation. Switch
+execution within each group remains serial. Confirm suitable capacity for your
+ND appliance. CLI YAML accepts `parallel_groups: 10`; `--parallel-groups 1`
+overrides YAML.
+
+In **Existing update groups**, click **Load existing update groups** to fetch
+groups and their switch members from the selected saved dashboard. Groups are
+identified by fabric and name, including matching names in different fabrics.
+Select the groups to reuse and optionally enter **Additional switches** using
+names, addresses, or serials. All current members are retained. Changing dashboards
+clears the selection. Membership is re-fetched during planning and immediately
+before applying; changes require reloading the groups. Additions must share the
+fabric, target image, upgrade eligibility, and checks. Existing groups are never
+automatically split, and switches in another group are not silently moved.
+CLI configurations can use `existing_groups` instead of `update_groups` or
+`switches.hosts`; see the commented example in
+[the ND input sheet](examples/nexus_dashboard/nxos_update_groups.example.yaml).
+
 The **Upgrade rules YAML** editor is prefilled with the current default rules and
 retains edits in your browser session. Its `upgrade_rules` list replaces all
 defaults for both plan and apply; the first matching rule wins. Model patterns
 are case-insensitive shell-style patterns; only N9K devices are eligible. Quote
 source/target versions. A source of `"10.6"` matches `10.6(3)` and `10.6.3`, not `10.60`.
+For legacy I-train images, use the complete dotted target release in both the
+rule and image-mapping key: `target_version: "7.0.3.I7.10"` and
+`"7.0.3.I7.10": nxos.7.0.3.I7.10.bin`. A target of `"7.0.3"` does not
+select I7.10 or I7.3. Verify the supported upgrade path for the specific model.
 For example, append this entry to the editor's list for that model:
 
 ```yaml

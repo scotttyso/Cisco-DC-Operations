@@ -927,7 +927,80 @@ def nxos_panel(kind: str):
     with ui.column().classes("w-full gap-4"):
         if kind == "nd":
             nd_profile = dashboard_picker("Nexus Dashboard appliance")
-            group_mode = ui.toggle({"named": "Named update groups", "per_switch": "Per-switch groups"}, value="named")
+            group_mode = ui.toggle({"named": "Named update groups", "per_switch": "Per-switch groups",
+                                    "existing": "Existing update groups"}, value="named")
+            existing_fields = []
+            loaded_profile = None
+            inventory_generation = 0
+            with ui.column().classes("w-full gap-3").bind_visibility_from(group_mode, "value", value="existing"):
+                ui.label("Load groups from ND, select groups to reuse, and optionally add switches. "
+                         "Current members cannot be removed. Incompatible additions are rejected.").classes("muted")
+                inventory_status = ui.label("No existing groups loaded").classes("muted")
+                existing_container = ui.column().classes("w-full gap-3")
+
+                def clear_existing():
+                    nonlocal loaded_profile, inventory_generation
+                    inventory_generation += 1
+                    loaded_profile = None
+                    existing_fields.clear()
+                    existing_container.clear()
+                    inventory_status.set_text("Dashboard changed; reload existing groups")
+
+                nd_profile.on_value_change(clear_existing)
+
+                async def load_existing():
+                    nonlocal loaded_profile
+                    values = {}
+                    generation = inventory_generation
+                    profile_id = nd_profile.value
+                    try:
+                        owner()
+                        profile = next((item for item in STORE.dashboards() if item["id"] == profile_id), None)
+                        if profile is None:
+                            raise ValueError("Select a Nexus Dashboard appliance")
+                        values = saved_credentials("dashboard", profile_id, "Nexus Dashboards")
+                        loaded_profile = None
+                        load_groups_button.disable()
+                        inventory_status.set_text("Loading ND groups and switch members...")
+
+                        def work():
+                            service = InterfaceDescriptions("https://" + profile["address"], values["username"],
+                                                            values["password"], bool(profile["verify_tls"]),
+                                                            values["domain"])
+                            try:
+                                return service.update_groups()
+                            finally:
+                                service.close()
+
+                        groups, inventory = await run.io_bound(work)
+                        owner()
+                        if generation != inventory_generation or profile_id != nd_profile.value:
+                            return
+                        existing_fields.clear()
+                        existing_container.clear()
+                        by_serial = {item["serial"]: item for item in inventory}
+                        with existing_container:
+                            for group in groups:
+                                with ui.column().classes("w-full gap-2"):
+                                    selected = ui.checkbox(f"{group['fabric']} / {group['name']}")
+                                    members = [f"{by_serial[serial]['name']} [{serial}]" if serial in by_serial
+                                               else serial for serial in group["members"]]
+                                    ui.label("Current members: " + (", ".join(members) or "(empty)")).classes("muted")
+                                    additions = ui.textarea(
+                                        "Additional switches", placeholder="Optional names, addresses, or serials"
+                                    ).props("outlined dense autogrow").classes("w-full")
+                                existing_fields.append({**group, "selected": selected, "hosts": additions})
+                        loaded_profile = profile_id
+                        inventory_status.set_text(f"Loaded {len(groups)} existing update groups")
+                    except (ValueError, RuntimeError, OSError, requests.RequestException) as exc:
+                        loaded_profile = None
+                        inventory_status.set_text(f"Load failed: {exc}")
+                        ui.notify(str(exc), type="negative")
+                    finally:
+                        values.clear()
+                        load_groups_button.enable()
+
+                load_groups_button = ui.button("Load existing update groups", icon="refresh", on_click=load_existing).props("outline")
             with ui.column().classes("w-full gap-4").bind_visibility_from(group_mode, "value", value="named"):
                 group_container = ui.column().classes("w-full gap-4")
 
@@ -975,6 +1048,9 @@ def nxos_panel(kind: str):
             ui.label("Map target versions to exact ND image filenames. Empty mapping uses automatic selection. "
                      "Mapped images must match the release and be Present or Verified N9K NX-OS images.").classes("muted")
             pre_report = ui.checkbox("Request pre-update report before staging", value=False)
+            parallel_groups = ui.number("Parallel update groups", value=10, min=1, max=10, precision=0).props("outlined dense")
+            ui.label("Concurrent API submission workflows only; ND completion is not monitored. "
+                     "Use 1 for sequential submission. Switch execution within each group remains serial.").classes("muted")
         else:
             config_input = ui.textarea("Bootflash YAML configuration", value=BOOTFLASH_EXAMPLE).props("outlined").classes("w-full code-input")
             direct = ui.switch("Connect directly to switches", value=True)
@@ -993,16 +1069,29 @@ def nxos_panel(kind: str):
             bootflash_values = {}
             try:
                 owner()
-                selection = nd_switch_selection(group_mode.value, devices.value or "",
-                                                [{"name": group["name"].value or "", "hosts": group["hosts"].value or ""}
-                                                 for group in group_fields]) if kind == "nd" else None
+                selection = None
                 if kind == "nd":
+                    if group_mode.value == "existing":
+                        if loaded_profile != nd_profile.value or loaded_profile is None:
+                            raise ValueError("Load existing groups for the selected Nexus Dashboard first")
+                        selected_groups = [{**group, "hosts": group["hosts"].value or ""}
+                                           for group in existing_fields if group["selected"].value]
+                    else:
+                        selected_groups = [{"name": group["name"].value or "", "hosts": group["hosts"].value or ""}
+                                           for group in group_fields]
+                    selection = nd_switch_selection(group_mode.value, devices.value or "", selected_groups)
+                    concurrency = parallel_groups.value
+                    if isinstance(concurrency, bool) or not isinstance(concurrency, (int, float)) or not 1 <= concurrency <= 10 or int(concurrency) != concurrency:
+                        raise ValueError("Parallel update groups must be an integer from 1 to 10")
+                    selection["parallel_groups"] = int(concurrency)
                     selection.update(nd_upgrade_rules_yaml(rules_input.value or ""))
                     selection.update(nd_image_mappings_yaml(images_input.value or ""))
                 if apply.value and not await confirm(
                     (f"Create/reuse groups from {len(selection['update_groups'])} named selection(s) and stage images? "
                      "Mixed check sets may create additional -vpc / -9508 groups."
-                     if "update_groups" in selection else "Create per-switch ND update groups and stage images?") if kind == "nd"
+                     if "update_groups" in selection else
+                     "Reuse selected existing ND groups, preserve members, attach additions, and stage images?"
+                     if "existing_groups" in selection else "Create per-switch ND update groups and stage images?") if kind == "nd"
                     else "Delete unneeded bootflash images and copy upgrade images?", "Apply staging",
                 ):
                     return

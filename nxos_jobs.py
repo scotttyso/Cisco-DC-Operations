@@ -26,8 +26,21 @@ def nd_switch_selection(mode: str, devices: str = "", groups: list[dict] | None 
         if not selected:
             raise ValueError("Enter at least one switch")
         return {"switches": {"hosts": selected}}
+    if mode == "existing":
+        entries = []
+        seen = set()
+        for group in groups or []:
+            key = (group["fabric"], group["name"])
+            if key in seen:
+                raise ValueError("Duplicate existing group selection")
+            seen.add(key)
+            entries.append({"fabric": group["fabric"], "name": group["name"],
+                            "members": list(group["members"]), "add_hosts": hosts(group.get("hosts", ""))})
+        if not entries:
+            raise ValueError("Load and select at least one existing update group")
+        return {"existing_groups": entries}
     if mode != "named":
-        raise ValueError("Select named update groups or per-switch groups")
+        raise ValueError("Select named, existing, or per-switch groups")
     result = {}
     members = set()
     for group in groups or []:

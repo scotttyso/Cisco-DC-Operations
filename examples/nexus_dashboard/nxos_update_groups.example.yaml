@@ -5,6 +5,19 @@ nexus_dashboard:
   verify_ssl: true
   password_env: DC_ND_PASSWORD
 
+# Concurrent group API workflows, not a limit on ND's actively running jobs.
+# Default 10; use 1 for sequential submission. Allowed range: 1-10.
+parallel_groups: 10
+
+# To reuse existing groups, replace update_groups below with existing_groups.
+# Copy the complete current serial membership from ND; it is revalidated.
+# Existing groups cannot be automatically split, renamed, or have members removed.
+# existing_groups:
+#   - fabric: my-fabric
+#     name: leaf-fx-10_6_4
+#     members: [FDO12345678, FDO12345679]
+#     add_hosts: [leaf103]  # Optional additions; use [] for no additions.
+
 # Optional: replaces all built-in rules. First matching rule wins; N9K only.
 # Quote versions. Omit this section to use these defaults automatically.
 upgrade_rules:
@@ -21,12 +34,17 @@ upgrade_rules:
   # - models: ["N9K-C93240YC-FX2"]
   #   source_version: "10.6"
   #   target_version: "10.6.4"
+  # Legacy I-train example; verify the model's supported upgrade path first.
+  # - models: ["N9K-C93180YC-EX"]
+  #   source_version: "7.0"
+  #   target_version: "7.0.3.I7.10"
 
 # Optional exact filename overrides for uploaded N9K NX-OS images.
 # Present and Verified images are accepted; omit entries for automatic selection.
 image_mappings: {}
 # To pin images, replace the empty mapping above with:
 # image_mappings:
+#   "7.0.3.I7.10": nxos.7.0.3.I7.10.bin
 #   "9.3.16": nxos.9.3.16.bin
 #   "10.3.10": nxos64-cs.10.3.10.M.bin
 #   "10.6.4": nxos64-cs.10.6.4.M.bin
