@@ -264,6 +264,8 @@ clears the selection. Membership is re-fetched during planning and immediately
 before applying; changes require reloading the groups. Additions must share the
 fabric, target image, upgrade eligibility, and checks. Existing groups are never
 automatically split, and switches in another group are not silently moved.
+ND's `None` placeholder represents unassigned switches, not an existing update
+group. Those switches can be added without triggering the cross-group move guard.
 CLI configurations can use `existing_groups` instead of `update_groups` or
 `switches.hosts`; see the commented example in
 [the ND input sheet](examples/nexus_dashboard/nxos_update_groups.example.yaml).

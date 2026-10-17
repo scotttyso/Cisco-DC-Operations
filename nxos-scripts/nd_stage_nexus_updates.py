@@ -519,6 +519,12 @@ def group_path(fabric: str, group: str) -> str:
     return fabric_path(fabric, "updateGroups/{}".format(quote(group, safe="")))
 
 
+def update_group_name(record: Dict[str, Any]) -> str:
+    name = field(record, "updateGroupName")
+    # ND lists unassigned switches under the placeholder group "None".
+    return "" if name == "None" else name
+
+
 def group_member_ids(record: Dict[str, Any]) -> List[str]:
     members = record.get("updateGroupSwitches")
     if not isinstance(members, list) or any(not isinstance(item, str) or not item for item in members):
@@ -534,7 +540,7 @@ def load_existing_groups(client: NexusDashboard, switches: Sequence[Switch]) -> 
         payload = client.request("GET", fabric_path(fabric, "updateGroups"))
         seen = set()
         for item in walk_records(payload):
-            name = field(item, "updateGroupName")
+            name = update_group_name(item)
             if not name:
                 continue
             if name in seen:
@@ -589,7 +595,7 @@ def submit_plans(
                     raise ValueError(f"Membership changed for {plan.group_name}; reload before applying")
                 payload = worker.request("GET", fabric_path(plan.fabric, "updateGroups"))
                 for other in walk_records(payload):
-                    name = field(other, "updateGroupName")
+                    name = update_group_name(other)
                     if name and name != plan.group_name and set(group_member_ids(other)).intersection(attach_by_name[key]):
                         raise ValueError(f"Cannot move switches from existing group {name} into {plan.group_name}")
             apply_plan(worker, plan, checks, attach_by_name[key], pre_report)
@@ -958,9 +964,9 @@ def main() -> int:
             update_groups_path = fabric_path(fabric, "updateGroups")
             payload = client.request("GET", update_groups_path)
             existing_by_fabric[fabric] = {
-                field(item, "updateGroupName"): item
+                update_group_name(item): item
                 for item in walk_records(payload)
-                if field(item, "updateGroupName")
+                if update_group_name(item)
             }
         attach_by_name = {}
         for plan in plans:

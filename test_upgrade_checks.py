@@ -813,12 +813,16 @@ class NXJobTests(unittest.TestCase):
         record = {"updateGroupName": "leaf", "updateGroupSwitches": ["s"]}
         entry = {"fabric": "F1", "name": "leaf", "members": ["s"], "add_hosts": ["new", "s"]}
         client = MagicMock()
-        client.request.return_value = record
+        client.request.return_value = [
+            record, {"updateGroupName": "None", "updateGroupSwitches": ["new"]},
+            {"updateGroupName": None, "updateGroupSwitches": ["new"]},
+        ]
         inventory_groups = helpers["load_existing_groups"](client, switches)
         self.assertEqual(inventory_groups, [
             {"fabric": fabric, "name": "leaf", "members": ["s"]} for fabric in ("F1", "F2")])
         self.assertEqual([call.args[1] for call in client.request.call_args_list],
                          [helpers["fabric_path"](fabric, "updateGroups") for fabric in ("F1", "F2")])
+        client.request.return_value = record
         groups, snapshots = helpers["resolve_existing_groups"](client, switches, [entry])
         self.assertEqual([item.serial for item in groups[0][1]], ["s", "new"])
         self.assertEqual(snapshots, {("F1", "leaf"): ["s"]})
@@ -860,7 +864,10 @@ class NXJobTests(unittest.TestCase):
                     if path == helpers["group_path"]("F1", "leaf"):
                         reads += 1
                         return {**record, "updateGroupSwitches": ["s", "late"]} if stale and reads > 1 else record
-                    return [record] + ([{"updateGroupName": "other", "updateGroupSwitches": ["new"]}] if conflict else [])
+                    return [
+                        record, {"updateGroupName": "None", "updateGroupSwitches": ["new"]},
+                        {"updateGroupName": None, "updateGroupSwitches": ["new"]},
+                    ] + ([{"updateGroupName": "other", "updateGroupSwitches": ["new"]}] if conflict else [])
 
                 client = MagicMock()
                 client.request.side_effect = request
