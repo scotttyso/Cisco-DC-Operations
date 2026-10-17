@@ -289,7 +289,7 @@ NEW_CHECKS = {
     "mac_address": "show mac address dynamic | sort",
 }
 NEW_CHECK_TEMPLATE = "Interface_status"
-POST_UPDATE_DELAY = 360
+POST_UPDATE_DELAY = 120
 CUSTOM_CHECK_PREFIX = "nxos_"
 GROUP_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,48}")
 

@@ -1142,12 +1142,22 @@ class NXJobTests(unittest.TestCase):
         mac = next(check for check in checks if check["reportCheckName"] == "nxos_mac_address")
         self.assertEqual(mac["cliCommand"], "show mac address dynamic | sort")
         self.assertEqual(mac["advancedChecks"], [])
-        self.assertEqual(mac["postUpdateDelay"], 360)
+        self.assertEqual(mac["postUpdateDelay"], 120)
         self.assertEqual(mac["checkType"], "custom")
         client.request.assert_called_once_with("GET", helpers["REPORT_CHECKS"])
         helpers["ensure_check_catalog"](client, current, checks)
         self.assertEqual([catalog[check["reportCheckName"]] for check in original], original)
         self.assertEqual(catalog["nxos_mac_address"], mac)
+        self.assertTrue(all(catalog[check["reportCheckName"]]["postUpdateDelay"] == 120 for check in checks))
+        for check in checks:
+            catalog[check["reportCheckName"]]["postUpdateDelay"] = 360
+        client.request.reset_mock()
+        current, checks = helpers["load_check_catalog"](client)
+        helpers["ensure_check_catalog"](client, current, checks)
+        updates = [call for call in client.request.call_args_list if call.args[0] == "PUT"]
+        self.assertEqual(len(updates), len(checks))
+        self.assertTrue(all(call.args[2]["postUpdateDelay"] == 120 for call in updates))
+        self.assertEqual([catalog[check["reportCheckName"]] for check in original], original)
         client.request.reset_mock()
         current, checks = helpers["load_check_catalog"](client)
         helpers["ensure_check_catalog"](client, current, checks)
