@@ -32,7 +32,7 @@ REQUIRED_FILES = (
     "VERSION", "requirements.txt", "automation_ui.py", "aci_checks.py", "aci_jump.py",
     "aci_ifstatus_common.py", "aci_leaf_ifstatus_pre.py", "aci_leaf_ifstatus_post.py",
     "secure_profiles.py", "oidc_auth.py", "release_updates.py", "nxos_jobs.py",
-    "nd_interfaces.py", "interface_description_table.py", "interface_description_table.js",
+    "nd_interfaces.py", "nd_telemetry.py", "interface_description_table.py", "interface_description_table.js",
     "nxos-scripts/nd_stage_nexus_updates.py", "nxos-scripts/nxos_bootflash_stage.py",
     "automation-appliance/install.sh", "automation-appliance/cisco-dc-automation.service",
 )

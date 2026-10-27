@@ -53,6 +53,63 @@ The update checker reads only public GitHub release metadata; no GitHub token is
 stored on the customer server. Published source archives exclude runtime profiles,
 credentials, vault keys, sessions, and reports.
 
+## Customer CLI Quick Reference (v0.2.0)
+
+Run these commands from an administrator SSH or console session on a standard
+appliance installation, not inside the WebUI.
+
+### Reset a Local WebUI Password
+
+Replace `CUSTOMER_USERNAME` with the exact existing WebUI username:
+
+```bash
+sudo -u cisco-dc-automation env \
+  DC_AUTOMATION_DATA=/var/lib/cisco-dc-automation \
+  DC_AUTOMATION_KEY_FILE=/var/lib/cisco-dc-automation-key/vault.key \
+  /opt/cisco-dc-automation/.venv/bin/python \
+  /opt/cisco-dc-automation/automation_ui.py --create-user CUSTOMER_USERNAME
+```
+
+Enter and confirm the new password at the hidden prompts. For an existing user,
+this resets the password, preserves their role, and invalidates their existing
+WebUI sessions. No application restart is required. A username that does not
+exist creates a new administrator, so check the spelling carefully. This changes
+a local WebUI password, not a Linux, device, or corporate OIDC password.
+
+These paths match the standard service configuration. If an administrator has
+overridden the data directory or vault-key configuration in
+`/etc/cisco-dc-automation/service.env`, use those same settings for the reset;
+do not create a replacement vault key.
+
+### Update to v0.2.0
+
+Finish all active jobs and follow the backup prerequisites above, then run:
+
+```bash
+sudo /usr/local/sbin/cisco-dc-update --version v0.2.0
+```
+
+Type `UPDATE` when prompted. The updater downloads the published source archive
+and checksum, verifies the checksum, backs up code/state/key, stops the service,
+installs the application, and checks backend readiness. It preserves application
+data, the vault key, and Nginx/TLS configuration. Protect the backup location
+printed by the updater and store the vault-key backup separately.
+
+Verify the installation:
+
+```bash
+cat /opt/cisco-dc-automation/VERSION
+sudo systemctl status cisco-dc-automation.service --no-pager
+curl --fail --silent --show-error --output /dev/null \
+  --write-out 'Backend HTTP %{http_code}\n' http://127.0.0.1:8088/login
+```
+
+Expect `v0.2.0`, an active service, and HTTP 200. Refresh the browser. If the update
+fails, inspect `sudo journalctl -u cisco-dc-automation.service -n 100 --no-pager`
+and follow the recovery instructions linked above; do not delete the vault key
+or rerun appliance provisioning. v0.1.1 and older installations need the one-time
+updater bootstrap described in the deployment guide.
+
 ## Configure Corporate OIDC
 
 An administrator opens **Account settings → Corporate sign-in (OIDC)** and sets

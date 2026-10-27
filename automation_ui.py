@@ -34,6 +34,7 @@ from aci_ifstatus_common import DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, validate_rol
 from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
 from nxos_jobs import NXJob, nd_switch_selection
 from nd_interfaces import InterfaceDescriptions, filter_interface_rows, nd_helpers, validate_description
+from nd_telemetry import TELEMETRY_EXAMPLE, TelemetryPush, push_plans, telemetry_selection
 from interface_description_table import InterfaceDescriptionTable
 from release_updates import installed_version, install_instructions, latest_release
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
@@ -1617,8 +1618,218 @@ def interface_description_panel():
     return dashboard, dashboard_changed
 
 
+def telemetry_push_panel():
+    state = {"plans": [], "profile": None, "selection": None, "direct": None, "busy": False, "report": None}
+    messages = queue.Queue()
+
+    def drain_log():
+        while not messages.empty():
+            log.push(messages.get_nowait())
+
+    def invalidate():
+        state.update(plans=[], profile=None, selection=None, direct=None)
+        preview_content.clear()
+        table.rows = []
+        table.update()
+        push_button.disable()
+        status.text = "Preview required"
+
+    def dashboard_changed():
+        owner()
+        if not state["busy"]:
+            invalidate()
+
+    def profile_values():
+        profile = next((entry for entry in STORE.dashboards() if entry["id"] == dashboard.value), None)
+        if profile is None:
+            raise ValueError("Select a Nexus Dashboard appliance")
+        return profile
+
+    def switch_values(selection):
+        username = selection["switches"]["username"]
+        values = STORE.credentials(owner(), "nd-telemetry") if use_saved.value else {}
+        entered = password.value or ""
+        if not entered and values.get("username") != username:
+            raise ValueError("Enter the automation password for the switch username in the YAML")
+        secret = entered or values.get("password", "")
+        if not secret:
+            raise ValueError("Enter a switch automation password")
+        if remember.value:
+            STORE.save_credentials(owner(), "nd-telemetry", {"username": username, "password": secret})
+            use_saved.value = True
+        return {"username": username, "password": secret}
+
+    def busy(value):
+        state["busy"] = value
+        for control in controls:
+            control.set_enabled(not value)
+        push_button.set_enabled(not value and bool(state["plans"]))
+
+    def render_plans(plans):
+        table.rows = [{key: value for key, value in plan.items() if key != "template"} for plan in plans]
+        table.update()
+        preview_content.clear()
+        with preview_content:
+            for plan in plans:
+                with ui.expansion(f"{plan['name']} | {plan['fabric']} | {plan['serial']}").classes("w-full"):
+                    ui.code(plan["template"], language="text").classes("w-full")
+
+    async def preview():
+        if state["busy"]:
+            return
+        values = {}
+        api_values = {}
+        jump = {}
+        busy(True)
+        try:
+            owner()
+            invalidate()
+            selection = telemetry_selection(config.value or "")
+            profile = profile_values()
+            values = switch_values(selection)
+            api_values = saved_credentials("dashboard", profile["id"], "Nexus Dashboards")
+            connect_directly = bool(direct.value)
+            jump = {} if connect_directly else ssh_jump(profile["id"])
+            log.clear()
+            status.text = "Fetching telemetry and discovering inband interfaces..."
+
+            def work():
+                service = TelemetryPush(profile, api_values)
+                try:
+                    return service.preview(selection, values["password"], jump or None)
+                finally:
+                    service.close()
+
+            plans = await run.io_bound(work)
+            owner()
+            state.update(plans=plans, profile=profile, selection=selection, direct=connect_directly, report=None)
+            render_plans(plans)
+            status.text = f"{len(plans)} switches ready. Review each template and source interface before pushing."
+        except Exception as error:
+            notify_error(error, {**api_values, "switch_password": values.get("password", ""),
+                                 "rescue_password": jump.get("password", "")})
+            status.text = "Preview failed; no telemetry was pushed"
+            password.value = ""
+        finally:
+            values.clear()
+            api_values.clear()
+            jump.clear()
+            busy(False)
+
+    async def push():
+        if state["busy"]:
+            return
+        values = {}
+        jump = {}
+        busy(True)
+        try:
+            owner()
+            selection = telemetry_selection(config.value or "")
+            profile = profile_values()
+            connect_directly = bool(direct.value)
+            if (not state["plans"] or state["profile"] != profile or state["selection"] != selection
+                    or state["direct"] != connect_directly):
+                invalidate()
+                raise ValueError("Selection, dashboard, or SSH route changed; preview again")
+            values = switch_values(selection)
+            jump = {} if connect_directly else ssh_jump(profile["id"])
+            route = "using direct SSH" if connect_directly else "via Nexus Dashboard"
+            if not await confirm(
+                f"Push the reviewed telemetry configuration to {len(state['plans'])} switches {route}? "
+                "Changes affect running-config immediately. No rollback or startup-config save is performed.",
+                "Push telemetry",
+            ):
+                return
+            owner()
+            if (profile_values() != profile or telemetry_selection(config.value or "") != selection
+                    or bool(direct.value) != connect_directly):
+                invalidate()
+                raise ValueError("Dashboard, selection, or SSH route changed during confirmation; preview again")
+            directory = output_directory() / "telemetry" / uuid4().hex
+            directory.mkdir(parents=True, mode=0o700)
+            report = directory / "report.json"
+            plans = state["plans"]
+            state["plans"] = []
+            status.text = "Pushing telemetry..."
+            results = await run.io_bound(push_plans, plans, values["username"], values["password"], jump or None, messages.put)
+            report.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            report.chmod(0o600)
+            state["report"] = report
+            owner()
+            table.rows = results
+            table.update()
+            status.text = " | ".join(f"{sum(result['state'] == value for result in results)} {value}"
+                                     for value in sorted({result["state"] for result in results}))
+            status.text += " | Preview again before another push"
+        except Exception as error:
+            notify_error(error, {**values, "rescue_password": jump.get("password", "")})
+            status.text = "Push did not complete; check the log for possible partial changes"
+        finally:
+            values.clear()
+            jump.clear()
+            password.value = ""
+            drain_log()
+            busy(False)
+
+    def forget():
+        owner()
+        STORE.forget_credentials(owner(), "nd-telemetry")
+        use_saved.value = False
+        password.value = ""
+        ui.notify("Saved telemetry switch credentials removed", type="positive")
+
+    def download():
+        owner()
+        if state["report"]:
+            ui.download.content(state["report"].read_bytes(), filename="telemetry-push.json")
+        else:
+            ui.notify("Run a telemetry push to create a report", type="warning")
+
+    with ui.column().classes("w-full gap-4"):
+        ui.label("Nexus Dashboard - Push Telemetry").classes("section-title")
+        ui.label("Preview ND software telemetry, then push via the appliance rescue-user SSH shell or direct SSH. "
+                 "Flow telemetry is not included. Running-config only; ND reception is not verified.").classes("muted")
+        dashboard = dashboard_picker("Nexus Dashboard appliance")
+        direct = ui.switch("Connect directly to switches", value=False)
+        ui.label("Unchecked: SSH through the selected dashboard as rescue-user. "
+                 "Checked: SSH from this server directly to switches; no rescue-user password is required. "
+                 "The selected dashboard and its API credentials are required in both modes.").classes("muted")
+        config = ui.textarea("Telemetry YAML configuration", value=TELEMETRY_EXAMPLE).props("outlined").classes("w-full code-input")
+        ui.label("Switches may be identified by ND name, management IP, or serial. "
+                 "The YAML username and automation password below are used for switch SSH, not ND API login. "
+                 "Inband discovery matches the ND management IP to a switch interface; "
+                 "use source_interfaces to override it, then preview again.").classes("muted")
+        password = ui.input("Automation password", password=True, password_toggle_button=True).props(
+            "outlined autocomplete=new-password").classes("w-full")
+        with ui.row().classes("items-center gap-4"):
+            use_saved = ui.checkbox("Use saved switch credentials", value=bool(STORE.credentials(owner(), "nd-telemetry")))
+            remember = ui.switch("Remember encrypted switch credentials", value=False)
+            forget_button = ui.button("Forget saved switch credentials", icon="key_off", on_click=forget).props("outline")
+        status = ui.label("Preview required").classes("muted")
+        with ui.row():
+            preview_button = ui.button("Preview telemetry", icon="preview", on_click=preview).props("outline")
+            push_button = ui.button("Push telemetry", icon="publish", color="negative", on_click=push)
+            push_button.disable()
+            ui.button("Download push report", icon="download", on_click=download).props("outline")
+        table = ui.table(columns=[{"name": key, "label": label, "field": key, "align": "left"}
+                                 for key, label in (("name", "Switch"), ("serial", "Serial"), ("fabric", "Fabric"),
+                                                    ("address", "Management IP"), ("vrf", "Telemetry VRF"),
+                                                    ("source_interface", "Inband source"), ("source", "Source selection"),
+                                                    ("state", "Result"), ("detail", "Detail"))],
+                         rows=[], row_key="serial", pagination=15).classes("w-full")
+        preview_content = ui.column().classes("w-full")
+        log = ui.log(max_lines=2000).classes("job-log")
+        ui.timer(0.2, drain_log)
+    controls = (dashboard, direct, config, password, use_saved, remember, forget_button, preview_button, push_button)
+    dashboard.on_value_change(dashboard_changed)
+    direct.on_value_change(invalidate)
+    config.on_value_change(invalidate)
+    return dashboard, dashboard_changed
+
+
 OPERATION_CATALOG = {
     "nd-interface-descriptions": ("Nexus Dashboard - Interface Descriptions", interface_description_panel),
+    "nd-push-telemetry": ("Nexus Dashboard - Push Telemetry", telemetry_push_panel),
 }
 
 
@@ -1657,7 +1868,7 @@ def upgrades_panel():
     return controls["aci-checks"]
 
 
-def dashboard_management(dashboard_selector, on_change):
+def dashboard_management(dashboard_selector, on_change, additional_controls=()):
     def refresh():
         owner()
         rows = inventory_rows("dashboard")
@@ -1668,6 +1879,9 @@ def dashboard_management(dashboard_selector, on_change):
         selected = dashboard_selector.value if dashboard_selector.value in options else None
         dashboard_selector.set_options(options, value=selected)
         on_change()
+        for selector, callback in additional_controls:
+            selector.set_options(options, value=selector.value if selector.value in options else None)
+            callback()
 
     def edit(existing=None):
         owner()
@@ -1772,7 +1986,8 @@ def workspace():
             with ui.tab_panel(apics):
                 apic_management(apic_selector, on_apic_change)
             with ui.tab_panel(dashboards):
-                dashboard_management(dashboard_selector, on_dashboard_change)
+                dashboard_management(dashboard_selector, on_dashboard_change,
+                                     [value for key, value in operation_controls.items() if key != "nd-interface-descriptions"])
 
 
 def main():

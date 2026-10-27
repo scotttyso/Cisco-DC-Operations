@@ -335,6 +335,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from nxos_jobs import NXJob
 from interface_description_table import InterfaceDescriptionTable
+from nd_telemetry import TelemetryPush
 root = Path(sys.argv[1])
 job = NXJob('nd', root / 'job', {}, {'password': 'synthetic'})
 assert job.script.parent == root / 'nxos-scripts'
@@ -367,6 +368,7 @@ assert arguments.nd_url == 'https://nd.example.com'
                 self.assertEqual(set(names), set(packaging.SOURCE_FILES))
                 self.assertIn("nxos-scripts/nd_stage_nexus_updates.py", names)
                 self.assertIn("automation-appliance/update.py", names)
+                self.assertIn("nd_telemetry.py", names)
                 self.assertTrue({"oidc_auth.py", "release_updates.py", "VERSION"}.issubset(names))
                 self.assertFalse(any(".venv" in name or "vault.key" in name or ".pkrvars" in name for name in names))
 

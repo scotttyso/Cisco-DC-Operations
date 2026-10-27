@@ -370,6 +370,69 @@ It does not create a baseline, run upgrade checks, or start an upgrade.
 Additional tools are registered in the UI's `OPERATION_CATALOG`, each with its own
 menu label and panel builder; operation-specific forms stay under their selected tool.
 
+#### Nexus Dashboard - Push Telemetry
+
+Select **Operations / Nexus Dashboard - Push Telemetry** to preview and push
+software telemetry configuration from ND to a list of switches.
+
+1. Select an appliance configured on **Nexus Dashboards**. Its saved shared or
+   overridden API credentials and **Rescue-user password** are used for ND.
+   **Connect directly to switches** is unchecked by default, using the ND
+   rescue-user SSH hop. Check it to connect from the application server directly
+   to switches for both interface discovery and telemetry push. Direct mode
+   does not require the rescue-user password; the selected dashboard and its
+   API credentials are still required to fetch inventory and templates.
+2. Provide the switch SSH username and switch list in the YAML editor:
+
+   ```yaml
+   switches:
+     username: netops
+     hosts:
+       - 192.0.2.101
+       - leaf2
+   source_interfaces: {}
+   ```
+
+   Hosts match ND management IPs, names, or serials. Missing, ambiguous, or
+   duplicate selections are rejected. Enter the separate switch **Automation
+   password** below the editor. Optional saved switch credentials are encrypted
+   and private to your WebUI account; passwords must not appear in YAML.
+3. **Preview telemetry** reads `/api/v1/manage/fabrics/<fabric>` and each switch's
+   `/api/v1/analyze/telemetry/switchesConfig?fabricName=<fabric>&switchId=<serial>`.
+   Only a valid `softwareConfiguration` is used; flow telemetry is not included.
+   `telemetrySourceVrf: management` leaves the ND template unchanged.
+   `default` (as returned in inband fabrics) and `inband` trigger source-interface
+   discovery using the selected SSH route and the YAML username and automation
+   password. The switch's ND management IP must
+   match exactly one interface in `show ip interface brief vrf all` (or its IPv6
+   equivalent); the fabric-level `telemetrySourceInterface` is not assumed to be
+   correct for every switch.
+4. Review the per-switch interface and expandable configuration previews.
+   To override discovery or resolve a missing/ambiguous match, add an interface
+   keyed by the exact switch entry in `hosts`, then preview again:
+
+   ```yaml
+   source_interfaces:
+     192.0.2.101: Vlan64
+     leaf2: Loopback0
+   ```
+
+   For inband only, the `source-interface` inside
+   `telemetry / destination-profile` is replaced. Other template content remains
+   unchanged. An unsupported VRF or missing source-interface blocks preview.
+5. **Push telemetry** requires confirmation and applies the reviewed configuration
+   to running-config via the selected SSH route. Changing YAML, dashboard
+   settings, or the direct-connection option invalidates preview. CLI errors stop the operation; subsequent
+   switches are marked **NOT_ATTEMPTED**. A failed switch may have partial changes.
+   Download the per-user JSON push report and preview again before retrying.
+
+**PUSHED** means the CLI accepted the commands, not that ND received telemetry.
+No automatic rollback or startup-config save is performed. SSH host-key and legacy
+crypto behavior follows the existing ND jump workflow. Validate on a noncritical
+switch first; this workflow has automated mock coverage, not live ND/NX-OS certification.
+
+#### Nexus Dashboard - Interface Descriptions
+
 1. On **Nexus Dashboards**, add the appliance display name, HTTPS address,
   and TLS verification setting. **Shared Nexus Dashboard
   credentials** stores your default **Login domain**, username, password, and **Rescue-user password**
@@ -493,7 +556,7 @@ deployment instructions. VM images and private build variables are not committed
 ### Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s . -p test_upgrade_checks.py -v
+.venv/bin/python -m unittest test_upgrade_checks test_nd_telemetry -v
 ```
 
 Tests use synthetic credentials and mocked devices, plus a real local subprocess
