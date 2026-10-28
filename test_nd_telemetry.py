@@ -108,13 +108,14 @@ class TelemetryInputTests(unittest.TestCase):
 
 
 class TelemetryPreviewTests(unittest.TestCase):
-    def service(self, vrf="default", template=TEMPLATE, valid=True, hosts=None, switch_vrf=None):
+    def service(self, vrf="default", template=TEMPLATE, valid=True, hosts=None, switch_vrf=None, switch_interface=None):
         service = self.last = object.__new__(TelemetryPush)
         service.client = MagicMock()
         inventory = [{"switchId": switch["serial"], "switchName": switch["name"],
                       "switchIp": switch["address"], "fabricName": switch["fabric"]} for switch in INVENTORY]
         payload = {"softwareConfiguration": template, "validSoftwareConfiguration": valid}
-        extra = {"platformType": "nx-os", **({"sourceVrfName": switch_vrf} if switch_vrf else {})}
+        extra = {"platformType": "nx-os", **({"sourceVrfName": switch_vrf} if switch_vrf else {}),
+                 **({"sourceInterfaceName": switch_interface} if switch_interface else {})}
         detail = {"switches": [{"serialNumber": switch["serial"], "fabricName": switch["fabric"], "additionalData": extra}
                                for switch in INVENTORY], "meta": {"counts": {"remaining": 0, "total": len(INVENTORY)}}}
 
@@ -140,8 +141,20 @@ class TelemetryPreviewTests(unittest.TestCase):
             {"switches": [row("A", "F1", "management"), row("B", "F2", "default")], "meta": {"counts": {"remaining": 1}}},
             {"switches": [row("C", "F1", "mgmt")], "meta": {"counts": {"remaining": 0}}},
         ]
-        self.assertEqual(service.inventory_vrfs("F1"), {"A": "management", "C": "management"})
+        self.assertEqual(service.inventory_vrfs("F1"), {"A": ("management", ""), "C": ("management", "")})
         self.assertIn("offset=2", service.client.request.call_args_list[1].args[1])
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_inventory_source_interface_skips_ssh_unless_overridden(self, ssh):
+        service = self.service(vrf="management", switch_vrf="default", switch_interface="vlan64")
+        plans = service.preview(SELECTION, "secret", None)
+        self.assertEqual(plans[0]["source_interface"], "vlan64")
+        self.assertEqual(plans[0]["source"], "ND inventory sourceInterfaceName")
+        self.assertIn("source-interface vlan64", plans[0]["template"])
+        ssh.assert_not_called()
+        selection = {**SELECTION, "source_interfaces": {"leaf1": "Vlan72"}}
+        plans = self.service(switch_vrf="default", switch_interface="vlan64").preview(selection, "secret", None)
+        self.assertEqual((plans[0]["source_interface"], plans[0]["source"]), ("Vlan72", "YAML override"))
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_switch_inventory_source_vrf_wins_over_fabric(self, ssh):

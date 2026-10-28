@@ -234,7 +234,7 @@ class TelemetryPush:
     def close(self) -> None:
         self.client.session.close()
 
-    def inventory_vrfs(self, fabric: str) -> dict[str, str]:
+    def inventory_vrfs(self, fabric: str) -> dict[str, tuple[str, str]]:
         vrfs = {}
         offset = 0
         while True:
@@ -248,7 +248,12 @@ class TelemetryPush:
                 serial = str(item.get("serialNumber") or item.get("switchId") or "")
                 if item.get("fabricName") == fabric and serial and isinstance(extra, dict) and extra.get("sourceVrfName") \
                         and str(extra.get("platformType") or "nx-os").casefold() == "nx-os":
-                    vrfs[serial] = normalize_vrf(extra["sourceVrfName"], fabric)
+                    vrf = normalize_vrf(extra["sourceVrfName"], fabric)
+                    try:
+                        interface = source_interface(str(extra.get("sourceInterfaceName") or "")) if vrf != "management" else ""
+                    except ValueError:
+                        interface = ""
+                    vrfs[serial] = (vrf, interface)
             offset += len(items)
             counts = (response.get("meta") or {}).get("counts") or {}
             if not counts.get("remaining") or offset >= 10000:
@@ -273,7 +278,7 @@ class TelemetryPush:
             fabric = switch["fabric"]
             if fabric not in inventories:
                 inventories[fabric] = self.inventory_vrfs(fabric)
-            vrf = inventories[fabric].get(switch["serial"])
+            vrf, inventory_interface = inventories[fabric].get(switch["serial"], (None, ""))
             if vrf is None:
                 if fabric not in fabrics:
                     fabrics[fabric] = self.fabric_vrf(fabric)
@@ -288,8 +293,11 @@ class TelemetryPush:
             origin = "ND template unchanged"
             if vrf != "management":
                 interface = selection["source_interfaces"].get(switch["selected_as"], "")
-                origin = "YAML override" if interface else "Discovered from ND management IP"
+                origin = "YAML override"
+                if not interface and inventory_interface:
+                    interface, origin = inventory_interface, "ND inventory sourceInterfaceName"
                 if not interface:
+                    origin = "Discovered from ND management IP"
                     connection = TelemetrySSH(switch["address"], selection["switches"]["username"], password, jump)
                     try:
                         interface = connection.discover(switch["address"])

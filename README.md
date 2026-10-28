@@ -397,13 +397,17 @@ software telemetry configuration from ND to a list of switches.
    duplicate selections are rejected. Enter the separate switch **Automation
    password** below the editor. Optional saved switch credentials are encrypted
    and private to your WebUI account; passwords must not appear in YAML.
-3. **Preview telemetry** reads `/api/v1/manage/fabrics/<fabric>` and each switch's
+3. **Preview telemetry** reads each switch's `sourceVrfName` and `sourceInterfaceName`
+   from the paged `/api/v1/manage/inventory/switches` (`additionalData`), falling back to
+   `/api/v1/manage/fabrics/<fabric>` `telemetrySourceVrf` (a missing value or `mgmt` means
+   `management`) when the inventory has no value. It then reads each switch's
    `/api/v1/analyze/telemetry/switchesConfig?fabricName=<fabric>&switchId=<serial>`.
    Only a valid `softwareConfiguration` is used; flow telemetry is not included.
-   `telemetrySourceVrf: management` leaves the ND template unchanged.
-   `default` (as returned in inband fabrics) and `inband` trigger source-interface
-   discovery using the selected SSH route and the YAML username and automation
-   password. The switch's ND management IP must
+   A `management` VRF leaves the ND template unchanged.
+   For `default` (as returned in inband fabrics) and `inband`, the source interface is
+   taken from a YAML override, else the inventory `sourceInterfaceName`, else discovered
+   over SSH using the selected route and the YAML username and automation
+   password. Discovery requires the switch's ND management IP to
    match exactly one interface in `show ip interface brief vrf all` (or its IPv6
    equivalent); the fabric-level `telemetrySourceInterface` is not assumed to be
    correct for every switch.
