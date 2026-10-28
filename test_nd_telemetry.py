@@ -174,7 +174,7 @@ class TelemetryPreviewTests(unittest.TestCase):
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_missing_vrf_field_is_management(self, ssh):
-        for vrf in (None, ""):
+        for vrf in (None, "", "mgmt", "MGMT"):
             with self.subTest(vrf=vrf):
                 plans = self.service(vrf=vrf).preview(SELECTION, "switch-secret", None)
                 self.assertEqual(plans[0]["source"], "ND template unchanged")

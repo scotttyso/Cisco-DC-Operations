@@ -239,7 +239,8 @@ class TelemetryPush:
                 if not isinstance(response, dict):
                     raise ValueError(f"{fabric}: ND returned an unexpected fabric record")
                 # ND omits the field when the fabric uses the management VRF
-                value = response.get("telemetrySourceVrf") or "management"
+                value = str(response.get("telemetrySourceVrf") or "management").strip()
+                value = {"mgmt": "management", "inband": "inband"}.get(value.casefold(), value)
                 if value not in {"management", "default", "inband"}:
                     raise ValueError(f"{fabric}: unsupported telemetrySourceVrf {value!r}")
                 fabrics[fabric] = value
