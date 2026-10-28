@@ -58,6 +58,12 @@ class TelemetryInputTests(unittest.TestCase):
                 selected_switches(INVENTORY, hosts)
         with self.assertRaises(ValueError):
             selected_switches(INVENTORY + [{**INVENTORY[1], "name": "leaf1"}], ["leaf1"])
+        fqdn = [{**INVENTORY[0], "name": "Leaf1.corp.example"}]
+        self.assertEqual(selected_switches(fqdn, ["leaf1"])[0]["serial"], "SERIAL1")
+        with self.assertRaisesRegex(ValueError, r"found 0.*ND returned 1 switches: Leaf1\.corp\.example"):
+            selected_switches(fqdn, ["leaf2"])
+        with self.assertRaises(ValueError):
+            selected_switches(fqdn, ["leaf1.other.example"])
 
     def test_source_discovery_matches_exact_management_ip_and_normalizes_aliases(self):
         output = ("IP Interface Status for VRF default(1)\n"
@@ -166,8 +172,16 @@ class TelemetryPreviewTests(unittest.TestCase):
         ssh.return_value.disconnect.assert_called_once()
         ssh.return_value.push.assert_not_called()
 
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_missing_vrf_field_is_management(self, ssh):
+        for vrf in (None, ""):
+            with self.subTest(vrf=vrf):
+                plans = self.service(vrf=vrf).preview(SELECTION, "switch-secret", None)
+                self.assertEqual(plans[0]["source"], "ND template unchanged")
+        ssh.assert_not_called()
+
     def test_invalid_fabric_or_template_blocks_preview(self):
-        for args in ({"vrf": None}, {"vrf": "unknown"}, {"valid": False}, {"template": ""},
+        for args in ({"vrf": "unknown"}, {"valid": False}, {"template": ""},
                      {"template": TEMPLATE.replace("source-interface vlan64", "")}):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 selection = {**SELECTION, "source_interfaces": {"leaf1": "Vlan72"}}

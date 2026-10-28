@@ -78,8 +78,16 @@ def selected_switches(inventory: list[dict], hosts: list[str]) -> list[dict]:
         matches = [switch for switch in inventory if host.casefold() in {
             str(switch[key]).casefold() for key in ("serial", "name", "address")
         }]
+        if not matches:
+            short = host.casefold().split(".")[0]
+            matches = [switch for switch in inventory
+                       if "." not in host and str(switch["name"]).casefold().split(".")[0] == short]
         if len(matches) != 1:
-            raise ValueError(f"{host}: expected exactly one matching ND switch, found {len(matches)}")
+            known = ", ".join(f"{switch['name']} ({switch['address'] or 'no IP'}, {switch['serial']})"
+                              for switch in inventory[:10])
+            raise ValueError(f"{host}: expected exactly one matching ND switch, found {len(matches)}. "
+                             f"ND returned {len(inventory)} switches"
+                             + (f": {known}" + (" ..." if len(inventory) > 10 else "") if inventory else ""))
         switch = matches[0]
         if switch["serial"] in seen:
             raise ValueError(f"{host}: the same switch was selected more than once")
@@ -228,9 +236,13 @@ class TelemetryPush:
             fabric = switch["fabric"]
             if fabric not in fabrics:
                 response = self.client.request("GET", "/manage/fabrics/" + quote(fabric, safe=""))
-                if not isinstance(response, dict) or response.get("telemetrySourceVrf") not in {"management", "default", "inband"}:
-                    raise ValueError(f"{fabric}: missing or unsupported telemetrySourceVrf")
-                fabrics[fabric] = response["telemetrySourceVrf"]
+                if not isinstance(response, dict):
+                    raise ValueError(f"{fabric}: ND returned an unexpected fabric record")
+                # ND omits the field when the fabric uses the management VRF
+                value = response.get("telemetrySourceVrf") or "management"
+                if value not in {"management", "default", "inband"}:
+                    raise ValueError(f"{fabric}: unsupported telemetrySourceVrf {value!r}")
+                fabrics[fabric] = value
             vrf = fabrics[fabric]
             payload = self.client.request("GET", "/analyze/telemetry/switchesConfig?" + urlencode(
                 {"fabricName": fabric, "switchId": switch["serial"]}))
