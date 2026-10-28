@@ -129,6 +129,20 @@ class TelemetryPreviewTests(unittest.TestCase):
         service.client.request.side_effect = request
         return service
 
+    def test_inventory_vrfs_are_paged_and_filtered_by_fabric(self):
+        service = object.__new__(TelemetryPush)
+        service.client = MagicMock()
+
+        def row(serial, fabric, vrf):
+            return {"serialNumber": serial, "fabricName": fabric,
+                    "additionalData": {"platformType": "nx-os", "sourceVrfName": vrf}}
+        service.client.request.side_effect = [
+            {"switches": [row("A", "F1", "management"), row("B", "F2", "default")], "meta": {"counts": {"remaining": 1}}},
+            {"switches": [row("C", "F1", "mgmt")], "meta": {"counts": {"remaining": 0}}},
+        ]
+        self.assertEqual(service.inventory_vrfs("F1"), {"A": "management", "C": "management"})
+        self.assertIn("offset=2", service.client.request.call_args_list[1].args[1])
+
     @patch("nd_telemetry.TelemetrySSH")
     def test_switch_inventory_source_vrf_wins_over_fabric(self, ssh):
         plans = self.service(vrf="default", switch_vrf="management").preview(SELECTION, "secret", None)
