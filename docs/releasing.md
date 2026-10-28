@@ -53,7 +53,7 @@ The update checker reads only public GitHub release metadata; no GitHub token is
 stored on the customer server. Published source archives exclude runtime profiles,
 credentials, vault keys, sessions, and reports.
 
-## Customer CLI Quick Reference (v0.2.2)
+## Customer CLI Quick Reference (v0.2.3)
 
 Run these commands from an administrator SSH or console session on a standard
 appliance installation, not inside the WebUI.
@@ -81,12 +81,12 @@ overridden the data directory or vault-key configuration in
 `/etc/cisco-dc-automation/service.env`, use those same settings for the reset;
 do not create a replacement vault key.
 
-### Update to v0.2.2
+### Update to v0.2.3
 
 Finish all active jobs and follow the backup prerequisites above, then run:
 
 ```bash
-sudo /usr/local/sbin/cisco-dc-update --version v0.2.2
+sudo /usr/local/sbin/cisco-dc-update --version v0.2.3
 ```
 
 Type `UPDATE` when prompted. The updater downloads the published source archive
@@ -104,7 +104,7 @@ curl --fail --silent --show-error --output /dev/null \
   --write-out 'Backend HTTP %{http_code}\n' http://127.0.0.1:8088/login
 ```
 
-Expect `v0.2.2`, an active service, and HTTP 200. Refresh the browser. If the update
+Expect `v0.2.3`, an active service, and HTTP 200. Refresh the browser. If the update
 fails, inspect `sudo journalctl -u cisco-dc-automation.service -n 100 --no-pager`
 and follow the recovery instructions linked above; do not delete the vault key
 or rerun appliance provisioning. v0.1.1 and older installations need the one-time

@@ -215,6 +215,15 @@ class TelemetrySSH(NexusDashboardSSH):
             raise
 
 
+def normalize_vrf(value, fabric: str) -> str:
+    # A missing field means management; ND may also abbreviate it as mgmt
+    text = str(value or "management").strip().casefold()
+    text = {"mgmt": "management"}.get(text, text)
+    if text not in {"management", "default", "inband"}:
+        raise ValueError(f"{fabric}: unsupported telemetry source VRF {value!r}")
+    return text
+
+
 class TelemetryPush:
     def __init__(self, profile: dict, credentials: dict):
         self.client = nd_helpers()["NexusDashboard"](
@@ -225,6 +234,24 @@ class TelemetryPush:
     def close(self) -> None:
         self.client.session.close()
 
+    def inventory_vrfs(self, fabric: str) -> dict[str, str]:
+        response = self.client.request("GET", "/manage/inventory/switches?" + urlencode({"fabricName": fabric}))
+        items = response.get("switches") if isinstance(response, dict) else None
+        vrfs = {}
+        for item in items if isinstance(items, list) else []:
+            extra = item.get("additionalData") if isinstance(item, dict) else None
+            serial = str(item.get("serialNumber") or item.get("switchId") or "") if isinstance(item, dict) else ""
+            if serial and isinstance(extra, dict) and extra.get("sourceVrfName"):
+                if str(extra.get("platformType") or "nx-os").casefold() == "nx-os":
+                    vrfs[serial] = normalize_vrf(extra["sourceVrfName"], fabric)
+        return vrfs
+
+    def fabric_vrf(self, fabric: str) -> str:
+        response = self.client.request("GET", "/manage/fabrics/" + quote(fabric, safe=""))
+        if not isinstance(response, dict):
+            raise ValueError(f"{fabric}: ND returned an unexpected fabric record")
+        return normalize_vrf(response.get("telemetrySourceVrf"), fabric)
+
     def preview(self, selection: dict, password: str, jump: dict | None) -> list[dict]:
         switches = nd_helpers()["load_switches"](self.client.request("GET", nd_helpers()["SWITCHES"]))
         inventory = [{"serial": switch.serial, "name": switch.name, "address": switch.address,
@@ -232,19 +259,16 @@ class TelemetryPush:
         targets = selected_switches(inventory, selection["switches"]["hosts"])
         plans = []
         fabrics = {}
+        inventories = {}
         for switch in targets:
             fabric = switch["fabric"]
-            if fabric not in fabrics:
-                response = self.client.request("GET", "/manage/fabrics/" + quote(fabric, safe=""))
-                if not isinstance(response, dict):
-                    raise ValueError(f"{fabric}: ND returned an unexpected fabric record")
-                # ND omits the field when the fabric uses the management VRF
-                value = str(response.get("telemetrySourceVrf") or "management").strip()
-                value = {"mgmt": "management", "inband": "inband"}.get(value.casefold(), value)
-                if value not in {"management", "default", "inband"}:
-                    raise ValueError(f"{fabric}: unsupported telemetrySourceVrf {value!r}")
-                fabrics[fabric] = value
-            vrf = fabrics[fabric]
+            if fabric not in inventories:
+                inventories[fabric] = self.inventory_vrfs(fabric)
+            vrf = inventories[fabric].get(switch["serial"])
+            if vrf is None:
+                if fabric not in fabrics:
+                    fabrics[fabric] = self.fabric_vrf(fabric)
+                vrf = fabrics[fabric]
             payload = self.client.request("GET", "/analyze/telemetry/switchesConfig?" + urlencode(
                 {"fabricName": fabric, "switchId": switch["serial"]}))
             if not isinstance(payload, dict) or payload.get("validSoftwareConfiguration") is not True:

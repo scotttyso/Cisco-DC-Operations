@@ -108,17 +108,33 @@ class TelemetryInputTests(unittest.TestCase):
 
 
 class TelemetryPreviewTests(unittest.TestCase):
-    def service(self, vrf="default", template=TEMPLATE, valid=True, hosts=None):
-        service = object.__new__(TelemetryPush)
+    def service(self, vrf="default", template=TEMPLATE, valid=True, hosts=None, switch_vrf=None):
+        service = self.last = object.__new__(TelemetryPush)
         service.client = MagicMock()
         inventory = [{"switchId": switch["serial"], "switchName": switch["name"],
                       "switchIp": switch["address"], "fabricName": switch["fabric"]} for switch in INVENTORY]
         payload = {"softwareConfiguration": template, "validSoftwareConfiguration": valid}
-        service.client.request.side_effect = [
-            {"items": inventory}, {"telemetrySourceVrf": vrf},
-            *[payload for _ in (hosts or [1])],
-        ]
+        extra = {"platformType": "nx-os", **({"sourceVrfName": switch_vrf} if switch_vrf else {})}
+        detail = {"switches": [{"serialNumber": switch["serial"], "additionalData": extra} for switch in INVENTORY]}
+
+        def request(method, path, *args, **kwargs):
+            if path.startswith("/manage/fabricSoftware"):
+                return {"items": inventory}
+            if path.startswith("/manage/inventory/switches"):
+                return detail
+            if path.startswith("/manage/fabrics/"):
+                return {"telemetrySourceVrf": vrf}
+            return payload
+        service.client.request.side_effect = request
         return service
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_switch_inventory_source_vrf_wins_over_fabric(self, ssh):
+        plans = self.service(vrf="default", switch_vrf="management").preview(SELECTION, "secret", None)
+        self.assertEqual(plans[0]["source"], "ND template unchanged")
+        ssh.assert_not_called()
+        paths = [call.args[1] for call in self.last.client.request.call_args_list]
+        self.assertFalse(any(path.startswith("/manage/fabrics/") for path in paths))
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_management_preserves_template_byte_for_byte_without_ssh(self, ssh):
@@ -128,8 +144,8 @@ class TelemetryPreviewTests(unittest.TestCase):
         self.assertEqual(plans[0]["source"], "ND template unchanged")
         ssh.assert_not_called()
         paths = [call.args[1] for call in service.client.request.call_args_list]
-        self.assertEqual(paths[1], "/manage/fabrics/Fabric%20%2F%20A")
-        self.assertEqual(paths[2], "/analyze/telemetry/switchesConfig?fabricName=Fabric+%2F+A&switchId=SERIAL1")
+        self.assertEqual(paths[2], "/manage/fabrics/Fabric%20%2F%20A")
+        self.assertEqual(paths[3], "/analyze/telemetry/switchesConfig?fabricName=Fabric+%2F+A&switchId=SERIAL1")
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_default_and_inband_discover_per_switch_and_close_both_hops(self, ssh):
@@ -161,7 +177,7 @@ class TelemetryPreviewTests(unittest.TestCase):
         service = self.service(hosts=[1, 2])
         plans = service.preview(selection, "secret", {"password": "rescue"})
         self.assertEqual([plan["source_interface"] for plan in plans], ["Vlan72", "Loopback0"])
-        self.assertEqual(service.client.request.call_count, 4)
+        self.assertEqual(service.client.request.call_count, 5)
         ssh.assert_not_called()
 
     @patch("nd_telemetry.TelemetrySSH")
