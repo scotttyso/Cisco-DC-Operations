@@ -235,15 +235,24 @@ class TelemetryPush:
         self.client.session.close()
 
     def inventory_vrfs(self, fabric: str) -> dict[str, str]:
-        response = self.client.request("GET", "/manage/inventory/switches?" + urlencode({"fabricName": fabric}))
-        items = response.get("switches") if isinstance(response, dict) else None
         vrfs = {}
-        for item in items if isinstance(items, list) else []:
-            extra = item.get("additionalData") if isinstance(item, dict) else None
-            serial = str(item.get("serialNumber") or item.get("switchId") or "") if isinstance(item, dict) else ""
-            if serial and isinstance(extra, dict) and extra.get("sourceVrfName"):
-                if str(extra.get("platformType") or "nx-os").casefold() == "nx-os":
+        offset = 0
+        while True:
+            response = self.client.request("GET", "/manage/inventory/switches?" + urlencode(
+                {"max": 100, "offset": offset, "sort": "hostname:asc"}))
+            items = response.get("switches") if isinstance(response, dict) else None
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                extra = item.get("additionalData") if isinstance(item, dict) else None
+                serial = str(item.get("serialNumber") or item.get("switchId") or "")
+                if item.get("fabricName") == fabric and serial and isinstance(extra, dict) and extra.get("sourceVrfName") \
+                        and str(extra.get("platformType") or "nx-os").casefold() == "nx-os":
                     vrfs[serial] = normalize_vrf(extra["sourceVrfName"], fabric)
+            offset += len(items)
+            counts = (response.get("meta") or {}).get("counts") or {}
+            if not counts.get("remaining") or offset >= 10000:
+                break
         return vrfs
 
     def fabric_vrf(self, fabric: str) -> str:

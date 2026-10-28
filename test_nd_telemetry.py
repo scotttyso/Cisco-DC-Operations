@@ -115,7 +115,8 @@ class TelemetryPreviewTests(unittest.TestCase):
                       "switchIp": switch["address"], "fabricName": switch["fabric"]} for switch in INVENTORY]
         payload = {"softwareConfiguration": template, "validSoftwareConfiguration": valid}
         extra = {"platformType": "nx-os", **({"sourceVrfName": switch_vrf} if switch_vrf else {})}
-        detail = {"switches": [{"serialNumber": switch["serial"], "additionalData": extra} for switch in INVENTORY]}
+        detail = {"switches": [{"serialNumber": switch["serial"], "fabricName": switch["fabric"], "additionalData": extra}
+                               for switch in INVENTORY], "meta": {"counts": {"remaining": 0, "total": len(INVENTORY)}}}
 
         def request(method, path, *args, **kwargs):
             if path.startswith("/manage/fabricSoftware"):
