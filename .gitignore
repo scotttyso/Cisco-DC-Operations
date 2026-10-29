@@ -19,3 +19,4 @@ automation-appliance/*.auto.pkrvars.hcl
 automation-appliance/output/
 automation-appliance/packer_cache/
 automation-appliance/crash.log
+QA/
