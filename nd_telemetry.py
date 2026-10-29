@@ -5,9 +5,11 @@ from __future__ import annotations
 import ipaddress
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Lock
 from urllib.parse import quote, urlencode
 
 import yaml
@@ -180,22 +182,22 @@ def replace_source(template: str, interface: str) -> str:
 
 
 class TelemetrySSH(NexusDashboardSSH):
-    def __init__(self, target: str, username: str, password: str, jump: dict | None):
-        super().__init__(target, username, password, jump, 60, switch_label="NX-OS switch")
+    def __init__(self, target: str, username: str, password: str, jump: dict | None, connect_timeout: int = 60):
+        super().__init__(target, username, password, jump, connect_timeout, switch_label="NX-OS switch")
 
-    def discover(self, address: str) -> str:
+    def discover(self, address: str, read_timeout: int = 90) -> str:
         family = "ipv6" if ":" in address else "ip"
-        output = self.send_command(f"show {family} interface brief vrf all", read_timeout=90)
+        output = self.send_command(f"show {family} interface brief vrf all", read_timeout=read_timeout)
         if CLI_ERROR.search(output):
             raise ValueError("Switch rejected interface discovery; add a source_interfaces override")
         return discover_source(output, address)
 
-    def push(self, template: str, notify: Callable[[str], None] | None = None) -> None:
+    def push(self, template: str, notify: Callable[[str], None] | None = None, read_timeout: int = 120) -> None:
         lines = configuration_lines(template)
         prompt = self.session._capture_prompt(r"[A-Za-z0-9][\w.\-]*# ?$")
         self.session.sw_prompt_re = re.escape(prompt.rstrip("# ")) + r"(?:\([^\r\n)]*\))?#\s*$"
 
-        def execute(command: str, timeout: int = 120) -> str:
+        def execute(command: str, timeout: int = read_timeout) -> str:
             if notify:
                 notify(f"> {command}")
             try:
@@ -225,7 +227,7 @@ class TelemetrySSH(NexusDashboardSSH):
                 previous_indent = indent
             execute("end")
             try:
-                output = execute("copy running-config startup-config", timeout=300)
+                output = execute("copy running-config startup-config", timeout=max(300, read_timeout))
                 if not re.search(r"(?im)\bcopy complete\b|\[OK\]", output):
                     raise RuntimeError("Switch did not confirm that the copy completed")
             except Exception as error:
@@ -286,7 +288,8 @@ class TelemetryPush:
             raise ValueError(f"{fabric}: ND returned an unexpected fabric record")
         return normalize_vrf(response.get("telemetrySourceVrf"), fabric)
 
-    def preview(self, selection: dict, password: str, jump: dict | None) -> list[dict]:
+    def preview(self, selection: dict, password: str, jump: dict | None,
+                connect_timeout: int = 60, read_timeout: int = 90) -> list[dict]:
         switches = nd_helpers()["load_switches"](self.client.request("GET", nd_helpers()["SWITCHES"]))
         inventory = [{"serial": switch.serial, "name": switch.name, "address": switch.address,
                       "fabric": switch.fabric} for switch in switches]
@@ -318,9 +321,9 @@ class TelemetryPush:
                     interface, origin = inventory_interface, "ND inventory sourceInterfaceName"
                 if not interface:
                     origin = "Discovered from ND management IP"
-                    connection = TelemetrySSH(switch["address"], selection["switches"]["username"], password, jump)
+                    connection = TelemetrySSH(switch["address"], selection["switches"]["username"], password, jump, connect_timeout)
                     try:
-                        interface = connection.discover(switch["address"])
+                        interface = connection.discover(switch["address"], read_timeout)
                     finally:
                         connection.disconnect()
                 template = replace_source(template, interface)
@@ -330,9 +333,18 @@ class TelemetryPush:
 
 
 def push_plans(plans: list[dict], username: str, password: str, jump: dict | None,
-               notify: Callable[[str], None], log_directory: Path | None = None) -> list[dict]:
-    results = []
-    stopped = False
+               notify: Callable[[str], None], log_directory: Path | None = None,
+               workers: int = 1, connect_timeout: int = 20, read_timeout: int = 90) -> list[dict]:
+    for label, value, maximum in (("Parallel switches", workers, 32),
+                                  ("SSH connection timeout", connect_timeout, None),
+                                  ("Per-command timeout", read_timeout, None)):
+        if (isinstance(value, bool) or not isinstance(value, int) or value < 1
+                or maximum is not None and value > maximum):
+            raise ValueError(f"{label} must be a positive integer" + (f" between 1 and {maximum}" if maximum else ""))
+    results: dict[int, dict] = {}
+    stopped = Event()
+    scheduling = Lock()
+    next_index = 0
 
     def redact(text: str) -> str:
         for secret in (password, jump["password"] if jump is not None else ""):
@@ -340,7 +352,8 @@ def push_plans(plans: list[dict], username: str, password: str, jump: dict | Non
                 text = text.replace(secret, "[REDACTED]")
         return text
 
-    for index, plan in enumerate(plans):
+    def push_switch(index: int, skipped: bool = False) -> dict:
+        plan = plans[index]
         result = {key: value for key, value in plan.items() if key != "template"}
         path = log_directory / f"switch-{index + 1}.log" if log_directory is not None else None
         if path is not None:
@@ -355,25 +368,46 @@ def push_plans(plans: list[dict], username: str, password: str, jump: dict | Non
                 notify(f"{plan['name']}: {text}")
 
             record(f"Switch {plan['name']} | {plan['serial']} | {plan['address']} | {plan['fabric']}")
-            if stopped:
+            if skipped:
                 result.update(state="NOT_ATTEMPTED", detail="Stopped after a previous switch failed")
             else:
                 connection = None
                 route = "via Nexus Dashboard rescue-user" if jump is not None else "directly to switch"
                 record(f"connecting {route}")
                 try:
-                    connection = TelemetrySSH(plan["address"], username, password, jump)
-                    connection.push(plan["template"], record)
+                    connection = TelemetrySSH(plan["address"], username, password, jump, connect_timeout)
+                    connection.push(plan["template"], record, read_timeout)
                     result.update(state="PUSHED", detail="CLI accepted configuration and confirmed startup-config save. "
                                   "Telemetry reception on ND has not been verified.")
                 except Exception as error:
                     result.update(state="FAILED", detail="Configuration may be partially applied: " + redact(str(error)))
-                    stopped = True
+                    with scheduling:
+                        stopped.set()
                 finally:
                     if connection:
                         connection.disconnect()
             record(f"{result['state']} - {result['detail']}")
-        results.append(result)
         if result["state"] == "FAILED":
-            notify("Stopped after failure; remaining switches were not attempted. Preview again before retrying.")
-    return results
+            notify("Stopped starting new switches after failure; in-progress switches will finish. "
+                   "Remaining switches will be NOT_ATTEMPTED. Preview again before retrying.")
+        return result
+
+    def worker() -> None:
+        nonlocal next_index
+        while True:
+            with scheduling:
+                if stopped.is_set() or next_index == len(plans):
+                    return
+                index = next_index
+                next_index += 1
+            result = push_switch(index)
+            with scheduling:
+                results[index] = result
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker) for _ in range(min(workers, len(plans)))]
+        for future in futures:
+            future.result()
+    for index in range(next_index, len(plans)):
+        results[index] = push_switch(index, skipped=True)
+    return [results[index] for index in range(len(plans))]

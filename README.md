@@ -432,17 +432,29 @@ software telemetry configuration from ND to a list of switches.
    For inband only, the `source-interface` inside
    `telemetry / destination-profile` is replaced. Other template content remains
    unchanged. An unsupported VRF or missing source-interface blocks preview.
-5. **Push telemetry** requires confirmation and applies the reviewed configuration
+5. Expand **Push settings** for the same controls as ACI **Capture settings**:
+   **Parallel switches** defaults to **20**, adjustable from **1 to 32**;
+   **SSH connection timeout (seconds)** defaults to **20**; and
+   **Per-command timeout (seconds)** defaults to **90**.
+   Set parallel switches to **1** for sequential pushes. Each concurrent switch
+   uses its own SSH session and log, including when using the ND rescue-user hop.
+   SSH timeouts also apply to preview interface discovery; preview remains sequential.
+   Startup-config saves allow at least **300 seconds**, or the configured per-command
+   timeout if larger.
+6. **Push telemetry** requires confirmation and applies the reviewed configuration
    to running-config via the selected SSH route, then runs
    `copy running-config startup-config` after each successful switch push.
    **This saves the entire running configuration, including unrelated unsaved changes.**
    A switch is marked **PUSHED** only after the CLI confirms the save completed.
    Changing YAML, dashboard
-   settings, or the direct-connection option invalidates preview. CLI errors stop the operation; subsequent
-   switches are marked **NOT_ATTEMPTED**. A failed switch may have partial changes.
+   settings, or the direct-connection option invalidates preview. On a CLI error,
+   no new switches are started; switches already in progress finish their
+   configuration and save. Switches that have not started are marked
+   **NOT_ATTEMPTED**. A failed switch may have partial changes.
    A save failure is reported as **FAILED**, even though telemetry may already be
-   applied to running-config; remaining switches are not attempted.
-6. Watch the live log for each command and its response. After the push, expand
+   applied to running-config; no new switches are started.
+7. Watch the live log for each command and its response, prefixed with its switch
+   name when concurrent output is interleaved. After the push, expand
    **Per-switch configuration logs** to review and download each switch's complete
    timestamped command/output transcript, including startup-config save output
    and any errors. Logs also record connection failures and skipped switches.

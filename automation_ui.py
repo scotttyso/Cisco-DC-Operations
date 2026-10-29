@@ -1648,6 +1648,19 @@ def telemetry_push_panel():
             raise ValueError("Select a Nexus Dashboard appliance")
         return profile
 
+    def push_settings():
+        settings = {}
+        for key, field, maximum in (("workers", workers, 32), ("connect_timeout", connect_timeout, None),
+                                     ("read_timeout", read_timeout, None)):
+            value = field.value
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not value >= 1 or not float(value).is_integer()
+                    or maximum is not None and value > maximum):
+                raise ValueError(f"{field._props['label']} must be a positive whole number"
+                                 + (f" between 1 and {maximum}" if maximum else ""))
+            settings[key] = int(value)
+        return settings
+
     def switch_values(selection, save=False):
         username = selection["switches"]["username"]
         values = STORE.credentials(owner(), "nd-telemetry") if use_saved.value else {}
@@ -1727,6 +1740,7 @@ def telemetry_push_panel():
             invalidate()
             selection = telemetry_selection(config.value or "")
             profile = profile_values()
+            settings = push_settings()
             values = switch_values(selection)
             api_values = saved_credentials("dashboard", profile["id"], "Nexus Dashboards")
             connect_directly = bool(direct.value)
@@ -1737,7 +1751,8 @@ def telemetry_push_panel():
             def work():
                 service = TelemetryPush(profile, api_values)
                 try:
-                    return service.preview(selection, values["password"], jump or None)
+                    return service.preview(selection, values["password"], jump or None,
+                                           settings["connect_timeout"], settings["read_timeout"])
                 finally:
                     service.close()
 
@@ -1768,6 +1783,7 @@ def telemetry_push_panel():
             selection = telemetry_selection(config.value or "")
             profile = profile_values()
             connect_directly = bool(direct.value)
+            settings = push_settings()
             if (not state["plans"] or state["profile"] != profile or state["selection"] != selection
                     or state["direct"] != connect_directly):
                 invalidate()
@@ -1776,7 +1792,9 @@ def telemetry_push_panel():
             jump = {} if connect_directly else ssh_jump(profile["id"])
             route = "using direct SSH" if connect_directly else "via Nexus Dashboard"
             if not await confirm(
-                f"Push the reviewed telemetry configuration to {len(state['plans'])} switches {route}? "
+                f"Push the reviewed telemetry configuration to {len(state['plans'])} switches {route} "
+                f"with up to {settings['workers']} parallel switches? "
+                "On failure, no new switches will start; in-progress switches will finish. "
                 "After each successful push, copy running-config startup-config saves ALL current running "
                 "configuration, including unrelated unsaved changes. No rollback is performed.",
                 "Push telemetry",
@@ -1784,9 +1802,9 @@ def telemetry_push_panel():
                 return
             owner()
             if (profile_values() != profile or telemetry_selection(config.value or "") != selection
-                    or bool(direct.value) != connect_directly):
+                    or bool(direct.value) != connect_directly or push_settings() != settings):
                 invalidate()
-                raise ValueError("Dashboard, selection, or SSH route changed during confirmation; preview again")
+                raise ValueError("Dashboard, selection, SSH route, or push settings changed during confirmation; preview again")
             directory = output_directory() / "telemetry" / uuid4().hex
             directory.mkdir(parents=True, mode=0o700)
             report = directory / "report.json"
@@ -1797,7 +1815,8 @@ def telemetry_push_panel():
             log.clear()
             status.text = "Pushing telemetry and saving startup-config..."
             results = await run.io_bound(push_plans, plans, values["username"], values["password"],
-                                         jump or None, messages.put, directory)
+                                         jump or None, messages.put, directory, settings["workers"],
+                                         settings["connect_timeout"], settings["read_timeout"])
             report.write_text(json.dumps(results, indent=2), encoding="utf-8")
             report.chmod(0o600)
             state["report"] = report
@@ -1843,6 +1862,14 @@ def telemetry_push_panel():
         ui.label("Unchecked: SSH through the selected dashboard as rescue-user. "
                  "Checked: SSH from this server directly to switches; no rescue-user password is required. "
                  "The selected dashboard and its API credentials are required in both modes.").classes("muted")
+        with ui.expansion("Push settings", icon="tune").classes("w-full"):
+            with ui.element("div").classes("form-grid"):
+                workers = ui.number("Parallel switches", value=20, min=1, max=32, precision=0).props("outlined dense")
+                connect_timeout = ui.number("SSH connection timeout (seconds)", value=20, min=1, precision=0).props("outlined dense")
+                read_timeout = ui.number("Per-command timeout (seconds)", value=90, min=1, precision=0).props("outlined dense")
+            ui.label("On failure, stop starting new switches and let in-progress switches finish. "
+                     "Use 1 parallel switch for sequential pushes. SSH timeouts also apply to preview discovery; "
+                     "startup-config saves allow at least 300 seconds.").classes("muted")
         config = ui.textarea("Telemetry YAML configuration", value=saved_config.get("yaml", TELEMETRY_EXAMPLE)).props(
             "outlined").classes("w-full code-input")
         save_yaml_button = ui.button("Save YAML", icon="save", on_click=save_yaml).props("outline")
@@ -1880,7 +1907,7 @@ def telemetry_push_panel():
         log = ui.log(max_lines=2000).classes("job-log")
         switch_logs = ui.column().classes("w-full")
         ui.timer(0.2, drain_log)
-    controls = (dashboard, direct, config, save_yaml_button, password, use_saved, remember,
+    controls = (dashboard, direct, workers, connect_timeout, read_timeout, config, save_yaml_button, password, use_saved, remember,
                 save_credentials_button, forget_button, preview_button, push_button)
     dashboard.on_value_change(dashboard_changed)
     direct.on_value_change(invalidate)

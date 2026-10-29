@@ -2,6 +2,7 @@ import copy
 import inspect
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -183,8 +184,8 @@ class TelemetryPreviewTests(unittest.TestCase):
                 ssh.return_value.discover.return_value = "Vlan72"
                 jump = {"host": "nd.example", "password": "rescue-secret"}
                 plans = self.service(vrf=vrf).preview(SELECTION, "switch-secret", jump)
-                ssh.assert_called_once_with("192.0.2.101", "netops", "switch-secret", jump)
-                ssh.return_value.discover.assert_called_once_with("192.0.2.101")
+                ssh.assert_called_once_with("192.0.2.101", "netops", "switch-secret", jump, 60)
+                ssh.return_value.discover.assert_called_once_with("192.0.2.101", 90)
                 ssh.return_value.disconnect.assert_called_once()
                 self.assertIn("source-interface Vlan72", plans[0]["template"])
                 self.assertEqual(plans[0]["source_interface"], "Vlan72")
@@ -193,7 +194,7 @@ class TelemetryPreviewTests(unittest.TestCase):
     def test_direct_discovery_connects_without_nd_rescue_credentials(self, ssh):
         ssh.return_value.discover.return_value = "Vlan72"
         plans = self.service().preview(SELECTION, "switch-secret", None)
-        ssh.assert_called_once_with("192.0.2.101", "netops", "switch-secret", None)
+        ssh.assert_called_once_with("192.0.2.101", "netops", "switch-secret", None, 60)
         ssh.return_value.disconnect.assert_called_once()
         self.assertIn("source-interface Vlan72", plans[0]["template"])
 
@@ -243,6 +244,92 @@ class TelemetryPreviewTests(unittest.TestCase):
 
 
 class TelemetryPushTests(unittest.TestCase):
+    def test_parallel_pushes_are_bounded_ordered_and_keep_logs_isolated(self):
+        barrier = threading.Barrier(3)
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+        connections = []
+        plans = [{**INVENTORY[0], "name": f"leaf{index}", "serial": f"SERIAL{index}",
+                  "address": f"192.0.2.{index + 1}", "template": TEMPLATE} for index in range(6)]
+
+        def connect(address, username, password, jump, connect_timeout):
+            connection = MagicMock()
+            connections.append(connection)
+            self.assertEqual(connect_timeout, 41)
+
+            def push(template, record, read_timeout):
+                nonlocal active, peak
+                self.assertEqual(read_timeout, 123)
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    barrier.wait(timeout=5)
+                    record(f"response from {address}")
+                finally:
+                    with lock:
+                        active -= 1
+            connection.push.side_effect = push
+            return connection
+
+        with tempfile.TemporaryDirectory() as temporary, patch("nd_telemetry.TelemetrySSH", side_effect=connect):
+            results = push_plans(plans, "netops", "secret", None, lambda _: None,
+                                 Path(temporary), workers=3, connect_timeout=41, read_timeout=123)
+            self.assertEqual(peak, 3)
+            self.assertEqual([result["serial"] for result in results], [plan["serial"] for plan in plans])
+            self.assertEqual([result["state"] for result in results], ["PUSHED"] * 6)
+            for index, result in enumerate(results):
+                text = (Path(temporary) / result["log_file"]).read_text()
+                responses = [line for line in text.splitlines() if "response from" in line]
+                self.assertEqual(len(responses), 1)
+                self.assertIn(f"response from {plans[index]['address']}", responses[0])
+            for connection in connections:
+                connection.disconnect.assert_called_once()
+
+    def test_parallel_failure_stops_new_connections_but_finishes_in_progress(self):
+        barrier = threading.Barrier(2)
+        failure_logged = threading.Event()
+        plans = [{**INVENTORY[0], "name": f"leaf{index}", "serial": f"SERIAL{index}",
+                  "address": f"192.0.2.{index + 1}", "template": TEMPLATE} for index in range(5)]
+        connections = []
+
+        def connect(address, *args):
+            connection = MagicMock()
+            connections.append(connection)
+
+            def push(template, record, read_timeout):
+                barrier.wait(timeout=5)
+                if address == plans[0]["address"]:
+                    raise RuntimeError("startup-config save failed")
+                if not failure_logged.wait(timeout=5):
+                    raise RuntimeError("Failure was not reported")
+                record("Copy complete.")
+            connection.push.side_effect = push
+            return connection
+
+        def notify(message):
+            if "FAILED -" in message:
+                failure_logged.set()
+
+        with tempfile.TemporaryDirectory() as temporary, patch("nd_telemetry.TelemetrySSH", side_effect=connect) as ssh:
+            results = push_plans(plans, "netops", "secret", None, notify, Path(temporary), workers=2)
+            self.assertEqual(ssh.call_count, 2)
+            self.assertEqual([result["state"] for result in results],
+                             ["FAILED", "PUSHED", "NOT_ATTEMPTED", "NOT_ATTEMPTED", "NOT_ATTEMPTED"])
+            self.assertEqual(len(list(Path(temporary).glob("*.log"))), 5)
+            for connection in connections:
+                connection.disconnect.assert_called_once()
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_invalid_parallel_settings_fail_before_connecting(self, ssh):
+        for settings in ({"workers": 0}, {"workers": 33}, {"workers": 1.5}, {"workers": True},
+                         {"connect_timeout": 0}, {"read_timeout": -1}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                push_plans([{**INVENTORY[0], "template": TEMPLATE}], "netops", "secret",
+                           None, lambda _: None, **settings)
+        ssh.assert_not_called()
+
     def connection(self):
         connection = object.__new__(TelemetrySSH)
         connection.session = MagicMock()
@@ -278,6 +365,15 @@ class TelemetryPushTests(unittest.TestCase):
                 connection.session.child.close.assert_called_once_with(force=True)
                 self.assertNotIn("copy running-config startup-config",
                                  [call.args[0] for call in connection.session.cmd.call_args_list])
+
+    def test_command_timeout_is_configurable_and_save_keeps_a_safe_minimum(self):
+        for timeout in (45, 600):
+            with self.subTest(timeout=timeout):
+                connection = self.connection()
+                connection.push(TEMPLATE, read_timeout=timeout)
+                calls = connection.session.cmd.call_args_list
+                self.assertTrue(all(call.kwargs["timeout"] == timeout for call in calls[:-1]))
+                self.assertEqual(calls[-1].kwargs["timeout"], max(300, timeout))
 
     def test_save_errors_timeouts_and_missing_confirmation_are_failures(self):
         for output in ("% Error copying configuration", "Permission denied", "", "Copy failed",
@@ -336,7 +432,7 @@ class TelemetryPushTests(unittest.TestCase):
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_failed_and_unattempted_switches_have_separate_logs(self, ssh):
-        def fail(template, record):
+        def fail(template, record, read_timeout):
             record("> feature telemetry")
             record("% Permission denied switch-secret")
             raise RuntimeError("Switch rejected configuration switch-secret")
@@ -376,7 +472,7 @@ class TelemetryPushTests(unittest.TestCase):
         log = []
         results = push_plans(plans, "netops", "switch-secret", None, log.append)
         self.assertEqual([result["state"] for result in results], ["PUSHED", "PUSHED"])
-        self.assertEqual(ssh.call_args.args[-1], None)
+        self.assertIsNone(ssh.call_args.args[3])
         self.assertTrue(any("connecting directly to switch" in line for line in log))
         ssh.return_value.push.side_effect = RuntimeError("failed switch-secret")
         log.clear()
@@ -443,6 +539,35 @@ class DirectSSHTests(unittest.TestCase):
 
 
 class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_push_settings_prevent_preview(self):
+        import automation_ui
+        from nicegui import ui
+
+        store = MagicMock()
+        store.credentials.return_value = {}
+        store.dashboards.return_value = [{"id": "nd1", "name": "ND", "address": "nd.example"}]
+        with patch.object(automation_ui, "STORE", store, create=True), \
+                patch.object(automation_ui, "owner", return_value="tester"), \
+                patch.object(automation_ui, "TelemetryPush") as service, \
+                patch.object(ui, "notify") as notify:
+            elements, buttons, config, password = self.telemetry_form()
+            dashboard = next(element for element in elements if isinstance(element, ui.select)
+                             and element._props.get("label") == "Nexus Dashboard appliance")
+            dashboard.value = "nd1"
+            config.value = "switches:\n  username: netops\n  hosts: [leaf1]\n"
+            numbers = {element._props.get("label"): element for element in elements if isinstance(element, ui.number)}
+            for label, value in (("Parallel switches", 0), ("Parallel switches", 33), ("Parallel switches", 1.5),
+                                 ("SSH connection timeout (seconds)", None), ("Per-command timeout (seconds)", 0)):
+                with self.subTest(label=label, value=value):
+                    field = numbers[label]
+                    previous = field.value
+                    field.value = value
+                    await self.click_callback(buttons["Preview telemetry"])()
+                    self.assertEqual(notify.call_args.kwargs["type"], "negative")
+                    self.assertIn(label, notify.call_args.args[0])
+                    field.value = previous
+            service.assert_not_called()
+
     def telemetry_form(self):
         import automation_ui
         from nicegui import ui
@@ -570,11 +695,13 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         preview_routes = []
         push_routes = []
 
-        def capture_preview(selection, password, jump):
+        def capture_preview(selection, password, jump, connect_timeout, read_timeout):
+            self.assertEqual((connect_timeout, read_timeout), (20, 90))
             preview_routes.append(None if jump is None else jump.copy())
             return plans
 
-        def capture_push(plans, username, password, jump, notify, directory):
+        def capture_push(plans, username, password, jump, notify, directory, workers, connect_timeout, read_timeout):
+            self.assertEqual((workers, connect_timeout, read_timeout), (4, 35, 150))
             push_routes.append(None if jump is None else jump.copy())
             path = directory / "switch-1.log"
             path.touch(mode=0o600)
@@ -608,6 +735,12 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(direct.value)
                 direct.value = direct_connection
                 buttons = {element.text: element for element in elements if isinstance(element, ui.button)}
+                numbers = {element._props.get("label"): element for element in elements if isinstance(element, ui.number)}
+                self.assertEqual(numbers["Parallel switches"].value, 20)
+                self.assertEqual(numbers["Parallel switches"]._props["min"], 1)
+                self.assertEqual(numbers["Parallel switches"]._props["max"], 32)
+                self.assertEqual(numbers["SSH connection timeout (seconds)"].value, 20)
+                self.assertEqual(numbers["Per-command timeout (seconds)"].value, 90)
                 if saved:
                     self.assertEqual(yaml_field.value, text)
                     self.assertEqual(password.value, "")
@@ -635,13 +768,19 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 expected_jump = None if direct_connection else {"host": "nd.example", "password": "rescue-secret"}
                 self.assertEqual(preview_routes, [expected_jump])
                 self.assertTrue(buttons["Push telemetry"].enabled)
+                numbers["Parallel switches"].value = 4
+                numbers["SSH connection timeout (seconds)"].value = 35
+                numbers["Per-command timeout (seconds)"].value = 150
                 await apply()
+                numbers["SSH connection timeout (seconds)"].value = 20
+                numbers["Per-command timeout (seconds)"].value = 90
                 confirm.assert_awaited_once()
                 push.assert_called_once()
                 self.assertEqual(push.call_args.args[1:3], (username, "switch-secret"))
                 self.assertEqual(push_routes, [expected_jump])
                 self.assertIn("direct SSH" if direct_connection else "via Nexus Dashboard", confirm.call_args.args[0])
                 self.assertIn("ALL current running", confirm.call_args.args[0])
+                self.assertIn("up to 4 parallel switches", confirm.call_args.args[0])
                 if direct_connection:
                     jump.assert_not_called()
                 else:
