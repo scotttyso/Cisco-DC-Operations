@@ -1621,6 +1621,9 @@ def interface_description_panel():
 def telemetry_push_panel():
     state = {"plans": [], "profile": None, "selection": None, "direct": None, "busy": False, "report": None}
     messages = queue.Queue()
+    account = owner()
+    saved_switch = STORE.credentials(account, "nd-telemetry")
+    saved_config = STORE.credentials(account, "nd-telemetry-settings")
 
     def drain_log():
         while not messages.empty():
@@ -1645,19 +1648,39 @@ def telemetry_push_panel():
             raise ValueError("Select a Nexus Dashboard appliance")
         return profile
 
-    def switch_values(selection):
+    def switch_values(selection, save=False):
         username = selection["switches"]["username"]
         values = STORE.credentials(owner(), "nd-telemetry") if use_saved.value else {}
         entered = password.value or ""
-        if not entered and values.get("username") != username:
-            raise ValueError("Enter the automation password for the switch username in the YAML")
+        if not entered and values and values.get("username") != username:
+            raise ValueError(f"Saved switch credentials are for {values.get('username')}, but the YAML uses {username}. "
+                             "Restore the matching YAML username or enter and save its automation password.")
         secret = entered or values.get("password", "")
         if not secret:
-            raise ValueError("Enter a switch automation password")
-        if remember.value:
+            raise ValueError("Enter a switch automation password or enable saved switch credentials. "
+                             "Use Save switch credentials to save without running a preview.")
+        if save or remember.value:
             STORE.save_credentials(owner(), "nd-telemetry", {"username": username, "password": secret})
             use_saved.value = True
+            credential_status.text = f"Encrypted switch credentials saved for {username}; the YAML username must match"
         return {"username": username, "password": secret}
+
+    def save_switch_credentials():
+        try:
+            switch_values(telemetry_selection(config.value or ""), save=True)
+            password.value = ""
+            ui.notify("Encrypted switch credentials saved", type="positive")
+        except (ValueError, InvalidToken) as error:
+            notify_error(error, {"password": password.value or ""})
+
+    def save_yaml():
+        try:
+            text = config.value or ""
+            telemetry_selection(text)
+            STORE.save_credentials(owner(), "nd-telemetry-settings", {"yaml": text})
+            ui.notify("Telemetry YAML saved for your account", type="positive")
+        except (ValueError, InvalidToken) as error:
+            notify_error(error)
 
     def busy(value):
         state["busy"] = value
@@ -1673,6 +1696,24 @@ def telemetry_push_panel():
             for plan in plans:
                 with ui.expansion(f"{plan['name']} | {plan['fabric']} | {plan['serial']}").classes("w-full"):
                     ui.code(plan["template"], language="text").classes("w-full")
+
+    def download_switch_log(path):
+        try:
+            owner()
+            ui.download.content(path.read_bytes(), filename=path.name)
+        except (OSError, ValueError) as error:
+            notify_error(error)
+
+    def render_switch_logs(directory, results):
+        switch_logs.clear()
+        with switch_logs:
+            ui.label("Per-switch configuration logs").classes("section-title")
+            for result in results:
+                path = directory / result["log_file"]
+                with ui.expansion(f"{result['name']} | {result['serial']} | {result['state']}").classes("w-full"):
+                    ui.button("Download switch log", icon="download",
+                              on_click=lambda path=path: download_switch_log(path)).props("outline")
+                    ui.code(path.read_text(encoding="utf-8"), language="text").classes("w-full")
 
     async def preview():
         if state["busy"]:
@@ -1736,7 +1777,8 @@ def telemetry_push_panel():
             route = "using direct SSH" if connect_directly else "via Nexus Dashboard"
             if not await confirm(
                 f"Push the reviewed telemetry configuration to {len(state['plans'])} switches {route}? "
-                "Changes affect running-config immediately. No rollback or startup-config save is performed.",
+                "After each successful push, copy running-config startup-config saves ALL current running "
+                "configuration, including unrelated unsaved changes. No rollback is performed.",
                 "Push telemetry",
             ):
                 return
@@ -1750,14 +1792,19 @@ def telemetry_push_panel():
             report = directory / "report.json"
             plans = state["plans"]
             state["plans"] = []
-            status.text = "Pushing telemetry..."
-            results = await run.io_bound(push_plans, plans, values["username"], values["password"], jump or None, messages.put)
+            state["report"] = None
+            switch_logs.clear()
+            log.clear()
+            status.text = "Pushing telemetry and saving startup-config..."
+            results = await run.io_bound(push_plans, plans, values["username"], values["password"],
+                                         jump or None, messages.put, directory)
             report.write_text(json.dumps(results, indent=2), encoding="utf-8")
             report.chmod(0o600)
             state["report"] = report
             owner()
             table.rows = results
             table.update()
+            render_switch_logs(directory, results)
             status.text = " | ".join(f"{sum(result['state'] == value for result in results)} {value}"
                                      for value in sorted({result["state"] for result in results}))
             status.text += " | Preview again before another push"
@@ -1776,6 +1823,7 @@ def telemetry_push_panel():
         STORE.forget_credentials(owner(), "nd-telemetry")
         use_saved.value = False
         password.value = ""
+        credential_status.text = "No saved switch credentials"
         ui.notify("Saved telemetry switch credentials removed", type="positive")
 
     def download():
@@ -1788,13 +1836,18 @@ def telemetry_push_panel():
     with ui.column().classes("w-full gap-4"):
         ui.label("Nexus Dashboard - Push Telemetry").classes("section-title")
         ui.label("Preview ND software telemetry, then push via the appliance rescue-user SSH shell or direct SSH. "
-                 "Flow telemetry is not included. Running-config only; ND reception is not verified.").classes("muted")
+                 "Successful pushes save running-config to startup-config, including other unsaved changes. "
+                 "Flow telemetry is not included; ND reception is not verified.").classes("muted")
         dashboard = dashboard_picker("Nexus Dashboard appliance")
         direct = ui.switch("Connect directly to switches", value=False)
         ui.label("Unchecked: SSH through the selected dashboard as rescue-user. "
                  "Checked: SSH from this server directly to switches; no rescue-user password is required. "
                  "The selected dashboard and its API credentials are required in both modes.").classes("muted")
-        config = ui.textarea("Telemetry YAML configuration", value=TELEMETRY_EXAMPLE).props("outlined").classes("w-full code-input")
+        config = ui.textarea("Telemetry YAML configuration", value=saved_config.get("yaml", TELEMETRY_EXAMPLE)).props(
+            "outlined").classes("w-full code-input")
+        save_yaml_button = ui.button("Save YAML", icon="save", on_click=save_yaml).props("outline")
+        ui.label("Save YAML to restore this configuration when you return, including after signing in again. "
+                 "Saved YAML is encrypted and private to your WebUI account; passwords are saved separately.").classes("muted")
         ui.label("Switches may be identified by ND name, management IP, or serial. "
                  "The YAML username and automation password below are used for switch SSH, not ND API login. "
                  "Inband discovery matches the ND management IP to a switch interface; "
@@ -1802,9 +1855,15 @@ def telemetry_push_panel():
         password = ui.input("Automation password", password=True, password_toggle_button=True).props(
             "outlined autocomplete=new-password").classes("w-full")
         with ui.row().classes("items-center gap-4"):
-            use_saved = ui.checkbox("Use saved switch credentials", value=bool(STORE.credentials(owner(), "nd-telemetry")))
+            use_saved = ui.checkbox("Use saved switch credentials", value=bool(saved_switch))
             remember = ui.switch("Remember encrypted switch credentials", value=False)
+            save_credentials_button = ui.button("Save switch credentials", icon="save", on_click=save_switch_credentials).props("outline")
             forget_button = ui.button("Forget saved switch credentials", icon="key_off", on_click=forget).props("outline")
+        credential_status = ui.label(
+            f"Encrypted switch credentials saved for {saved_switch['username']}; the YAML username must match"
+            if saved_switch else "No saved switch credentials").classes("muted")
+        ui.label("Save switch credentials stores the password now. Remember encrypted switch credentials "
+                 "stores it when you preview; it does not save the YAML.").classes("muted")
         status = ui.label("Preview required").classes("muted")
         with ui.row():
             preview_button = ui.button("Preview telemetry", icon="preview", on_click=preview).props("outline")
@@ -1819,8 +1878,10 @@ def telemetry_push_panel():
                          rows=[], row_key="serial", pagination=15).classes("w-full")
         preview_content = ui.column().classes("w-full")
         log = ui.log(max_lines=2000).classes("job-log")
+        switch_logs = ui.column().classes("w-full")
         ui.timer(0.2, drain_log)
-    controls = (dashboard, direct, config, password, use_saved, remember, forget_button, preview_button, push_button)
+    controls = (dashboard, direct, config, save_yaml_button, password, use_saved, remember,
+                save_credentials_button, forget_button, preview_button, push_button)
     dashboard.on_value_change(dashboard_changed)
     direct.on_value_change(invalidate)
     config.on_value_change(invalidate)

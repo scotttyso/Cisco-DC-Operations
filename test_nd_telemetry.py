@@ -246,20 +246,24 @@ class TelemetryPushTests(unittest.TestCase):
     def connection(self):
         connection = object.__new__(TelemetrySSH)
         connection.session = MagicMock()
-        connection.session.cmd.return_value = ""
+        connection.session.cmd.side_effect = lambda command, **_: (
+            "Copy complete." if command == "copy running-config startup-config" else "")
         connection.session._capture_prompt.return_value = "leaf1#"
         return connection
 
-    def test_push_respects_config_submode_indentation_and_never_saves_startup(self):
+    def test_push_respects_config_submode_indentation_and_saves_startup_last(self):
         connection = self.connection()
-        connection.push(TEMPLATE)
+        log = []
+        connection.push(TEMPLATE, log.append)
         commands = [call.args[0] for call in connection.session.cmd.call_args_list]
         self.assertEqual(commands[:4], ["configure terminal", "feature telemetry", "feature grpc", "telemetry"])
         index = commands.index("destination-group 500")
         self.assertEqual(commands[index - 1], "exit")
-        self.assertEqual(commands[-1], "end")
+        self.assertEqual(commands[-2:], ["end", "copy running-config startup-config"])
         self.assertEqual(commands.count("exit"), 4)
-        self.assertNotIn("copy running-config startup-config", commands)
+        self.assertEqual(connection.session.cmd.call_args.kwargs["timeout"], 300)
+        self.assertEqual([line[2:] for line in log if line.startswith("> ")], commands)
+        self.assertEqual(log[-1], "Copy complete.")
         self.assertIn('path "show processes cpu" depth unbounded', commands)
         self.assertRegex("leaf1(config-tm-dest)#", connection.session.sw_prompt_re)
 
@@ -272,6 +276,85 @@ class TelemetryPushTests(unittest.TestCase):
                     connection.push(TEMPLATE)
                 self.assertEqual(connection.session.cmd.call_count, 3)
                 connection.session.child.close.assert_called_once_with(force=True)
+                self.assertNotIn("copy running-config startup-config",
+                                 [call.args[0] for call in connection.session.cmd.call_args_list])
+
+    def test_save_errors_timeouts_and_missing_confirmation_are_failures(self):
+        for output in ("% Error copying configuration", "Permission denied", "", "Copy failed",
+                       TimeoutError("copy timed out")):
+            with self.subTest(output=output):
+                connection = self.connection()
+
+                def command(text, **_):
+                    if text == "copy running-config startup-config":
+                        if isinstance(output, Exception):
+                            raise output
+                        return output
+                    return ""
+
+                connection.session.cmd.side_effect = command
+                with self.assertRaisesRegex(RuntimeError, "startup-config save failed"):
+                    connection.push(TEMPLATE)
+                connection.session.child.close.assert_called_once_with(force=True)
+
+    def test_command_error_output_and_timeout_partial_output_are_logged(self):
+        for output in ("% Invalid command", TimeoutError("session timed out")):
+            with self.subTest(output=output):
+                connection = self.connection()
+                connection.session.cmd.side_effect = ["", output]
+                connection.session.child.before = "partial switch response"
+                log = []
+                with self.assertRaises((RuntimeError, TimeoutError)):
+                    connection.push(TEMPLATE, log.append)
+                self.assertIn("> feature telemetry", log)
+                self.assertIn(output if isinstance(output, str) else "partial switch response", log)
+
+    def test_persistent_logs_include_every_command_response_and_save_confirmation(self):
+        connection = self.connection()
+        connection.session.cmd.side_effect = lambda command, **_: (
+            "Copy complete." if command == "copy running-config startup-config" else
+            f"response for {command}\nswitch-secret rescue-secret")
+        plans = [{**INVENTORY[0], "template": TEMPLATE}]
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("nd_telemetry.TelemetrySSH", return_value=connection):
+            messages = []
+            results = push_plans(plans, "netops", "switch-secret", {"password": "rescue-secret"},
+                                 messages.append, Path(temporary))
+            path = Path(temporary) / results[0]["log_file"]
+            text = path.read_text()
+            commands = [call.args[0] for call in connection.session.cmd.call_args_list]
+            for command in commands:
+                self.assertIn(f"> {command}\n", text)
+                if command != "copy running-config startup-config":
+                    self.assertIn(f"response for {command}\n", text)
+            self.assertIn("Copy complete.", text)
+            self.assertIn("PUSHED", text)
+            self.assertIn("confirmed startup-config save", results[0]["detail"])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("switch-secret", text + str(messages))
+            self.assertNotIn("rescue-secret", text + str(messages))
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_failed_and_unattempted_switches_have_separate_logs(self, ssh):
+        def fail(template, record):
+            record("> feature telemetry")
+            record("% Permission denied switch-secret")
+            raise RuntimeError("Switch rejected configuration switch-secret")
+
+        ssh.return_value.push.side_effect = fail
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            results = push_plans([{**switch, "template": TEMPLATE} for switch in INVENTORY],
+                                 "netops", "switch-secret", None, lambda _: None, directory)
+            self.assertEqual([result["state"] for result in results], ["FAILED", "NOT_ATTEMPTED"])
+            self.assertEqual(len(list(directory.glob("*.log"))), 2)
+            failed, skipped = [(directory / result["log_file"]).read_text() for result in results]
+            self.assertIn("% Permission denied [REDACTED]", failed)
+            self.assertIn("FAILED", failed)
+            self.assertIn("NOT_ATTEMPTED", skipped)
+            self.assertNotIn("> feature telemetry", skipped)
+            self.assertNotIn("copy running-config", failed)
+            ssh.assert_called_once()
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_reports_partial_failure_redacts_secrets_and_stops_remaining_switches(self, ssh):
@@ -294,7 +377,7 @@ class TelemetryPushTests(unittest.TestCase):
         results = push_plans(plans, "netops", "switch-secret", None, log.append)
         self.assertEqual([result["state"] for result in results], ["PUSHED", "PUSHED"])
         self.assertEqual(ssh.call_args.args[-1], None)
-        self.assertIn("connecting directly to switch", log[0])
+        self.assertTrue(any("connecting directly to switch" in line for line in log))
         ssh.return_value.push.side_effect = RuntimeError("failed switch-secret")
         log.clear()
         results = push_plans(plans, "netops", "switch-secret", None, log.append)
@@ -307,7 +390,8 @@ class TelemetryPushTests(unittest.TestCase):
                              {"password": "rescue"}, lambda message: None)
         self.assertEqual(results[0]["state"], "PUSHED")
         self.assertIn("not been verified", results[0]["detail"])
-        ssh.return_value.push.assert_called_once_with(TEMPLATE)
+        self.assertEqual(ssh.return_value.push.call_args.args[0], TEMPLATE)
+        self.assertTrue(callable(ssh.return_value.push.call_args.args[1]))
         ssh.return_value.disconnect.assert_called_once()
 
 
@@ -359,13 +443,114 @@ class DirectSSHTests(unittest.TestCase):
 
 
 class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
+    def telemetry_form(self):
+        import automation_ui
+        from nicegui import ui
+        from nicegui.client import Client
+        from nicegui.page import page
+
+        client = Client(page("/telemetry-save-test"))
+        self.addCleanup(client.delete)
+        with client, ui.column() as container:
+            automation_ui.telemetry_push_panel()
+        elements = list(container.descendants())
+        buttons = {element.text: element for element in elements if isinstance(element, ui.button)}
+        config = next(element for element in elements if isinstance(element, ui.textarea))
+        password = next(element for element in elements if isinstance(element, ui.input)
+                        and element._props.get("label") == "Automation password")
+        return elements, buttons, config, password
+
+    @staticmethod
+    def click_callback(button):
+        listener = next(listener for listener in button._event_listeners.values() if listener.type == "click")
+        return inspect.getclosurevars(listener.handler).nonlocals["callback"]
+
+    async def test_explicit_saves_survive_reopening_and_are_private_to_account(self):
+        import automation_ui
+        from nicegui import ui
+        from secure_profiles import ProfileStore
+
+        text = "switches:\n  username: switch-admin\n  hosts: [leaf1]\nsource_interfaces:\n  leaf1: Vlan72\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = ProfileStore(directory / "data", directory / "vault.key")
+            store.add_user("tester", "webui-test-password")
+            store.add_user("other", "other-test-password")
+            with patch.object(automation_ui, "STORE", store, create=True), \
+                    patch.object(automation_ui, "owner", return_value="tester") as owner, \
+                    patch.object(automation_ui, "TelemetryPush") as service, \
+                    patch.object(ui, "notify") as notify:
+                elements, buttons, config, password = self.telemetry_form()
+                config.value = text
+                password.value = "switch-secret"
+                self.click_callback(buttons["Save YAML"])()
+                self.assertEqual(store.credentials("tester", "nd-telemetry"), {})
+                self.click_callback(buttons["Save switch credentials"])()
+                self.assertEqual(store.credentials("tester", "nd-telemetry"),
+                                 {"username": "switch-admin", "password": "switch-secret"})
+                self.assertEqual(password.value, "")
+                service.assert_not_called()
+                notify.assert_called()
+
+                reopened = ProfileStore(directory / "data", directory / "vault.key")
+                with patch.object(automation_ui, "STORE", reopened):
+                    elements, buttons, config, password = self.telemetry_form()
+                    self.assertEqual(config.value, text)
+                    self.assertEqual(password.value, "")
+                    saved = next(element for element in elements if isinstance(element, ui.checkbox)
+                                 and element.text == "Use saved switch credentials")
+                    self.assertTrue(saved.value)
+                    self.assertTrue(any("switch-admin" in getattr(element, "text", "") for element in elements))
+                    self.assertFalse(buttons["Push telemetry"].enabled)
+                    owner.return_value = "other"
+                    elements, buttons, config, password = self.telemetry_form()
+                    self.assertEqual(config.value, automation_ui.TELEMETRY_EXAMPLE)
+                    self.assertEqual(reopened.credentials("other", "nd-telemetry"), {})
+
+    async def test_saves_reject_invalid_yaml_and_mismatched_saved_username(self):
+        import automation_ui
+        from nicegui import ui
+
+        store = MagicMock()
+        store.credentials.side_effect = lambda _, scope: (
+            {"username": "old-user", "password": "saved-secret"} if scope == "nd-telemetry" else {})
+        with patch.object(automation_ui, "STORE", store, create=True), \
+                patch.object(automation_ui, "owner", return_value="tester"), \
+                patch.object(ui, "notify") as notify:
+            elements, buttons, config, password = self.telemetry_form()
+            config.value = "switches:\n  username: new-user\n  hosts: [leaf1]\npassword: forbidden\n"
+            self.click_callback(buttons["Save YAML"])()
+            store.save_credentials.assert_not_called()
+            self.assertEqual(notify.call_args.kwargs["type"], "negative")
+            config.value = "switches:\n  username: new-user\n  hosts: [leaf1]\n"
+            self.click_callback(buttons["Save switch credentials"])()
+            store.save_credentials.assert_not_called()
+            self.assertEqual(notify.call_args.kwargs["type"], "negative")
+            self.assertIn("old-user", notify.call_args.args[0])
+            self.assertIn("new-user", notify.call_args.args[0])
+            password.value = "replacement-secret"
+            self.click_callback(buttons["Save switch credentials"])()
+            store.save_credentials.assert_called_once_with(
+                "tester", "nd-telemetry", {"username": "new-user", "password": "replacement-secret"})
+            self.click_callback(buttons["Forget saved switch credentials"])()
+            store.forget_credentials.assert_called_once_with("tester", "nd-telemetry")
+            self.assertEqual(password.value, "")
+            self.assertTrue(any(getattr(element, "text", "") == "No saved switch credentials"
+                                for element in elements))
+
     async def test_preview_confirmation_push_report_and_invalidation(self):
         await self.exercise_workflow(False)
 
     async def test_direct_mode_skips_rescue_credentials_and_requires_new_preview_on_route_change(self):
         await self.exercise_workflow(True)
 
-    async def exercise_workflow(self, direct_connection):
+    async def test_saved_yaml_and_switch_password_work_without_reentering_credentials(self):
+        await self.exercise_workflow(False, saved=True)
+
+    async def test_remember_still_saves_credentials_during_preview(self):
+        await self.exercise_workflow(False, remember_credentials=True)
+
+    async def exercise_workflow(self, direct_connection, saved=False, remember_credentials=False):
         import automation_ui
         from nicegui import ui
         from nicegui.client import Client
@@ -374,7 +559,12 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         profile = {"id": "nd1", "name": "ND", "address": "nd.example", "verify_tls": True}
         store = MagicMock()
         store.dashboards.return_value = [profile]
-        store.credentials.return_value = {}
+        username = "switch-admin" if saved else "netops"
+        text = f"switches:\n  username: {username}\n  hosts: [leaf1]\n"
+        store.credentials.side_effect = lambda _, scope: ({
+            "nd-telemetry": {"username": username, "password": "switch-secret"},
+            "nd-telemetry-settings": {"yaml": text},
+        }.get(scope, {}) if saved else {})
         plans = [{**INVENTORY[0], "vrf": "default", "source_interface": "Vlan72",
                   "source": "Discovered", "template": TEMPLATE, "state": "READY", "detail": ""}]
         preview_routes = []
@@ -384,9 +574,12 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
             preview_routes.append(None if jump is None else jump.copy())
             return plans
 
-        def capture_push(plans, username, password, jump, notify):
+        def capture_push(plans, username, password, jump, notify, directory):
             push_routes.append(None if jump is None else jump.copy())
-            return [{**INVENTORY[0], "state": "PUSHED"}]
+            path = directory / "switch-1.log"
+            path.touch(mode=0o600)
+            path.write_text("> feature telemetry\n> copy running-config startup-config\nCopy complete.\n")
+            return [{**INVENTORY[0], "state": "PUSHED", "log_file": path.name}]
 
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(automation_ui, "STORE", store, create=True), \
@@ -415,8 +608,15 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(direct.value)
                 direct.value = direct_connection
                 buttons = {element.text: element for element in elements if isinstance(element, ui.button)}
-                yaml_field.value = "switches:\n  username: netops\n  hosts: [leaf1]\n"
-                password.value = "switch-secret"
+                if saved:
+                    self.assertEqual(yaml_field.value, text)
+                    self.assertEqual(password.value, "")
+                else:
+                    yaml_field.value = text
+                    password.value = "switch-secret"
+                remember = next(element for element in elements if isinstance(element, ui.switch)
+                                and element.text == "Remember encrypted switch credentials")
+                remember.value = remember_credentials
                 def click_callback(button):
                     listener = next(listener for listener in button._event_listeners.values() if listener.type == "click")
                     return inspect.getclosurevars(listener.handler).nonlocals["callback"]
@@ -426,15 +626,22 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(buttons["Push telemetry"].enabled)
                 await preview()
                 service.return_value.close.assert_called_once()
+                if remember_credentials:
+                    store.save_credentials.assert_called_once_with(
+                        "tester", "nd-telemetry", {"username": username, "password": "switch-secret"})
+                    use_saved = next(element for element in elements if isinstance(element, ui.checkbox)
+                                     and element.text == "Use saved switch credentials")
+                    self.assertTrue(use_saved.value)
                 expected_jump = None if direct_connection else {"host": "nd.example", "password": "rescue-secret"}
                 self.assertEqual(preview_routes, [expected_jump])
                 self.assertTrue(buttons["Push telemetry"].enabled)
                 await apply()
                 confirm.assert_awaited_once()
                 push.assert_called_once()
-                self.assertEqual(push.call_args.args[1:3], ("netops", "switch-secret"))
+                self.assertEqual(push.call_args.args[1:3], (username, "switch-secret"))
                 self.assertEqual(push_routes, [expected_jump])
                 self.assertIn("direct SSH" if direct_connection else "via Nexus Dashboard", confirm.call_args.args[0])
+                self.assertIn("ALL current running", confirm.call_args.args[0])
                 if direct_connection:
                     jump.assert_not_called()
                 else:
@@ -445,7 +652,17 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(reports), 1)
                 self.assertNotIn("secret", reports[0].read_text())
                 self.assertEqual(reports[0].stat().st_mode & 0o777, 0o600)
-                password.value = "switch-secret"
+                switch_log = reports[0].parent / "switch-1.log"
+                self.assertTrue(switch_log.is_file())
+                self.assertTrue(any(isinstance(element, ui.code) and "Copy complete." in element.content
+                                    for element in container.descendants()))
+                download_button = next(element for element in container.descendants()
+                                       if isinstance(element, ui.button) and element.text == "Download switch log")
+                with patch.object(ui.download, "content") as download:
+                    self.click_callback(download_button)()
+                    download.assert_called_once_with(switch_log.read_bytes(), filename="switch-1.log")
+                if not saved:
+                    password.value = "switch-secret"
                 await preview()
                 self.assertTrue(buttons["Push telemetry"].enabled)
                 direct.value = not direct_connection

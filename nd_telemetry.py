@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 import yaml
@@ -186,15 +190,25 @@ class TelemetrySSH(NexusDashboardSSH):
             raise ValueError("Switch rejected interface discovery; add a source_interfaces override")
         return discover_source(output, address)
 
-    def push(self, template: str) -> None:
+    def push(self, template: str, notify: Callable[[str], None] | None = None) -> None:
         lines = configuration_lines(template)
         prompt = self.session._capture_prompt(r"[A-Za-z0-9][\w.\-]*# ?$")
         self.session.sw_prompt_re = re.escape(prompt.rstrip("# ")) + r"(?:\([^\r\n)]*\))?#\s*$"
 
-        def execute(command: str) -> None:
-            output = self.session.cmd(command, timeout=120)
+        def execute(command: str, timeout: int = 120) -> str:
+            if notify:
+                notify(f"> {command}")
+            try:
+                output = self.session.cmd(command, timeout=timeout)
+            except Exception:
+                if notify and isinstance(self.session.child.before, str):
+                    notify(self.session.child.before)
+                raise
+            if notify and output:
+                notify(output)
             if CLI_ERROR.search(output):
                 raise RuntimeError(f"Switch rejected '{command}': {output.strip()[:1200]}")
+            return output
 
         try:
             execute("configure terminal")
@@ -210,6 +224,12 @@ class TelemetrySSH(NexusDashboardSSH):
                 execute(line.strip())
                 previous_indent = indent
             execute("end")
+            try:
+                output = execute("copy running-config startup-config", timeout=300)
+                if not re.search(r"(?im)\bcopy complete\b|\[OK\]", output):
+                    raise RuntimeError("Switch did not confirm that the copy completed")
+            except Exception as error:
+                raise RuntimeError(f"Telemetry applied to running-config, but startup-config save failed: {error}") from error
         except Exception:
             self.session.child.close(force=True)
             raise
@@ -309,33 +329,51 @@ class TelemetryPush:
         return plans
 
 
-def push_plans(plans: list[dict], username: str, password: str, jump: dict | None, notify) -> list[dict]:
+def push_plans(plans: list[dict], username: str, password: str, jump: dict | None,
+               notify: Callable[[str], None], log_directory: Path | None = None) -> list[dict]:
     results = []
-    for plan in plans:
-        connection = None
+    stopped = False
+
+    def redact(text: str) -> str:
+        for secret in (password, jump["password"] if jump is not None else ""):
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return text
+
+    for index, plan in enumerate(plans):
         result = {key: value for key, value in plan.items() if key != "template"}
-        route = "via Nexus Dashboard rescue-user" if jump is not None else "directly to switch"
-        notify(f"{plan['name']}: connecting {route}")
-        try:
-            connection = TelemetrySSH(plan["address"], username, password, jump)
-            connection.push(plan["template"])
-            result.update(state="PUSHED", detail="CLI accepted configuration; running-config only. "
-                          "Telemetry reception on ND has not been verified.")
-        except Exception as error:
-            detail = str(error)
-            for secret in (password, jump["password"] if jump is not None else ""):
-                if secret:
-                    detail = detail.replace(secret, "[REDACTED]")
-            result.update(state="FAILED", detail="Configuration may be partially applied: " + detail)
-        finally:
-            if connection:
-                connection.disconnect()
+        path = log_directory / f"switch-{index + 1}.log" if log_directory is not None else None
+        if path is not None:
+            path.touch(mode=0o600, exist_ok=False)
+            result["log_file"] = path.name
+        with (path.open("w", encoding="utf-8") if path is not None else nullcontext()) as stream:
+            def record(message: str) -> None:
+                text = redact(message)
+                if stream is not None:
+                    stream.write(f"{datetime.now(timezone.utc).isoformat()} {text}\n")
+                    stream.flush()
+                notify(f"{plan['name']}: {text}")
+
+            record(f"Switch {plan['name']} | {plan['serial']} | {plan['address']} | {plan['fabric']}")
+            if stopped:
+                result.update(state="NOT_ATTEMPTED", detail="Stopped after a previous switch failed")
+            else:
+                connection = None
+                route = "via Nexus Dashboard rescue-user" if jump is not None else "directly to switch"
+                record(f"connecting {route}")
+                try:
+                    connection = TelemetrySSH(plan["address"], username, password, jump)
+                    connection.push(plan["template"], record)
+                    result.update(state="PUSHED", detail="CLI accepted configuration and confirmed startup-config save. "
+                                  "Telemetry reception on ND has not been verified.")
+                except Exception as error:
+                    result.update(state="FAILED", detail="Configuration may be partially applied: " + redact(str(error)))
+                    stopped = True
+                finally:
+                    if connection:
+                        connection.disconnect()
+            record(f"{result['state']} - {result['detail']}")
         results.append(result)
-        notify(f"{plan['name']}: {result['state']} - {result['detail']}")
         if result["state"] == "FAILED":
             notify("Stopped after failure; remaining switches were not attempted. Preview again before retrying.")
-            break
-    for plan in plans[len(results):]:
-        results.append({**{key: value for key, value in plan.items() if key != "template"},
-                        "state": "NOT_ATTEMPTED", "detail": "Stopped after a previous switch failed"})
     return results

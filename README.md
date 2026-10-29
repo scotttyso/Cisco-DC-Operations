@@ -395,8 +395,16 @@ software telemetry configuration from ND to a list of switches.
 
    Hosts match ND management IPs, names, or serials. Missing, ambiguous, or
    duplicate selections are rejected. Enter the separate switch **Automation
-   password** below the editor. Optional saved switch credentials are encrypted
-   and private to your WebUI account; passwords must not appear in YAML.
+   password** below the editor. Click **Save switch credentials** to save it
+   immediately, without running a preview. **Remember encrypted switch credentials**
+   saves the password when you preview, not when you toggle the switch.
+   **Use saved switch credentials** reuses it only when the saved username matches
+   `switches.username` in the YAML; the page shows the saved username.
+   Click **Save YAML** to restore the editor contents when you return to the page
+   or sign in again. YAML and switch credentials are saved separately, encrypted,
+   and private to your WebUI account. Saving YAML does not save the password,
+   and forgetting switch credentials does not delete the saved YAML.
+   Passwords must not appear in YAML.
 3. **Preview telemetry** reads each switch's `sourceVrfName` and `sourceInterfaceName`
    from the paged `/api/v1/manage/inventory/switches` (`additionalData`), falling back to
    `/api/v1/manage/fabrics/<fabric>` `telemetrySourceVrf` (a missing value or `mgmt` means
@@ -425,13 +433,26 @@ software telemetry configuration from ND to a list of switches.
    `telemetry / destination-profile` is replaced. Other template content remains
    unchanged. An unsupported VRF or missing source-interface blocks preview.
 5. **Push telemetry** requires confirmation and applies the reviewed configuration
-   to running-config via the selected SSH route. Changing YAML, dashboard
+   to running-config via the selected SSH route, then runs
+   `copy running-config startup-config` after each successful switch push.
+   **This saves the entire running configuration, including unrelated unsaved changes.**
+   A switch is marked **PUSHED** only after the CLI confirms the save completed.
+   Changing YAML, dashboard
    settings, or the direct-connection option invalidates preview. CLI errors stop the operation; subsequent
    switches are marked **NOT_ATTEMPTED**. A failed switch may have partial changes.
+   A save failure is reported as **FAILED**, even though telemetry may already be
+   applied to running-config; remaining switches are not attempted.
+6. Watch the live log for each command and its response. After the push, expand
+   **Per-switch configuration logs** to review and download each switch's complete
+   timestamped command/output transcript, including startup-config save output
+   and any errors. Logs also record connection failures and skipped switches.
+   The password-redacted log files and JSON report are stored under your private
+   `runs/<account-hash>/telemetry/<run-id>/` directory in the application data directory.
+   Each log has permissions `0600`; the run directory has permissions `0700`.
    Download the per-user JSON push report and preview again before retrying.
 
-**PUSHED** means the CLI accepted the commands, not that ND received telemetry.
-No automatic rollback or startup-config save is performed. SSH host-key and legacy
+**PUSHED** means the CLI accepted the commands and confirmed the startup-config save,
+not that ND received telemetry. No automatic rollback is performed. SSH host-key and legacy
 crypto behavior follows the existing ND jump workflow. Validate on a noncritical
 switch first; this workflow has automated mock coverage, not live ND/NX-OS certification.
 
