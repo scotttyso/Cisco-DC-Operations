@@ -2,6 +2,8 @@
 
 import contextlib
 import io
+import pexpect
+from netmiko.exceptions import ReadTimeout
 import re
 import runpy
 import shlex
@@ -74,7 +76,11 @@ class NexusDashboardSSH:
     def send_command(self, command: str, read_timeout: int, cmd_verify: bool = False) -> str:
         from aci_ifstatus_common import assert_read_only
         assert_read_only(command)
-        return self.session.cmd(command, timeout=read_timeout)
+        try:
+            return self.session.cmd(command, timeout=read_timeout)
+        except pexpect.TIMEOUT as error:
+            raise ReadTimeout(f"ND jump command timed out after {read_timeout}s; "
+                              f"expected pattern: {self.session.sw_prompt_re!r}") from error
 
     def disconnect(self):
         try:

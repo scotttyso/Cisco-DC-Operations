@@ -49,6 +49,11 @@ class JumpConnectionTests(unittest.TestCase):
         self.assertEqual(session._authenticate.call_args_list[0].args[0], "rescue-secret")
         self.assertEqual(session._authenticate.call_args_list[1].args[0], "switch-secret")
         self.assertEqual(connection.send_command("show module", read_timeout=90), "output")
+        import pexpect
+        session.cmd.side_effect = pexpect.TIMEOUT("timeout")
+        with self.assertRaises(common.ReadTimeout):
+            connection.send_command("show module", read_timeout=90)
+        session.cmd.side_effect = None
         with self.assertRaises(RuntimeError):
             connection.send_command("reload", read_timeout=90)
         connection.disconnect()
@@ -325,6 +330,8 @@ class ACICancelUITests(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         def cancelled_capture(*args, **kwargs):
             self.assertTrue(kwargs["ssh_diagnostics"])
+            self.assertEqual(kwargs["reconnects_per_command"], 2)
+            self.assertEqual(kwargs["reconnects_per_switch"], 5)
             started.set()
             if not kwargs["cancel_event"].wait(5):
                 raise AssertionError("Cancel button did not signal capture")
@@ -357,6 +364,10 @@ class ACICancelUITests(unittest.IsolatedAsyncioTestCase):
                             if getattr(item, "text", "") == "Record SSH diagnostics (password-redacted)")
             self.assertFalse(checkbox.value)
             checkbox.value = True
+            next(item for item in client.elements.values()
+                 if item._props.get("label") == "Maximum reconnects per command").value = 2
+            next(item for item in client.elements.values()
+                 if item._props.get("label") == "Maximum reconnects per switch").value = 5
             start = next(item for item in client.elements.values() if item._props.get("label") == "Run ACI checks")
             cancel = next(item for item in client.elements.values() if item._props.get("label") == "Cancel ACI checks")
             self.assertFalse(cancel.enabled)
@@ -2470,19 +2481,134 @@ class ACICommandComparisonTests(unittest.TestCase):
 
 
 class ACIQueryCaptureTests(unittest.TestCase):
+    @patch("aci_jump.NexusDashboardSSH")
+    def test_nd_jump_reconnects_from_failed_command(self, connect):
+        first, second = MagicMock(), MagicMock()
+        first.send_command.side_effect = common.ReadTimeout("jump timeout")
+        second.send_command.side_effect = ["retry output", "last output"]
+        connect.side_effect = [first, second]
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=("show module", "show vpc"),
+                                               jump={"host": "nd", "password": "synthetic-rescue"})
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual([call.args[0] for call in second.send_command.call_args_list],
+                         ["show module", "show vpc"])
+        self.assertTrue(all(row["status"] == "OK" for row in results.values()))
+
+    @patch("aci_checks.capture_leaf_commands")
+    def test_capture_records_and_passes_reconnect_limits(self, capture):
+        baseline = {"id": "pre", "apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": ["show module"], "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": "101", "name": "leaf101", "oob_ip": "192.0.2.101"}}]}
+        capture.return_value = {"show module": {"status": "OK", "output": "output"}}
+        snapshot = capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic",
+                                    baseline=baseline, reconnects_per_command=2, reconnects_per_switch=5)
+        self.assertEqual(snapshot["reconnects_per_command"], 2)
+        self.assertEqual(snapshot["reconnects_per_switch"], 5)
+        self.assertEqual(capture.call_args.kwargs["reconnects_per_command"], 2)
+        self.assertEqual(capture.call_args.kwargs["reconnects_per_switch"], 5)
+
+    @patch.object(common, "ConnectHandler")
+    def test_reconnect_retries_failed_command_without_repeating_successful_commands(self, connect):
+        first, second = MagicMock(), MagicMock()
+        first.send_command.side_effect = ["first output", common.ReadTimeout("missing prompt")]
+        second.send_command.side_effect = ["retried output", "last output"]
+        connect.side_effect = [first, second]
+        commands = ("show version", "show module", "show vpc")
+        diagnostics = {}
+        messages = []
+        results = common.capture_leaf_commands("switch", "user", "synthetic", commands=commands,
+                                               diagnostics=diagnostics, notify=messages.append)
+        self.assertEqual([call.args[0] for call in first.send_command.call_args_list], list(commands[:2]))
+        self.assertEqual([call.args[0] for call in second.send_command.call_args_list], list(commands[1:]))
+        self.assertEqual(results["show version"]["output"], "first output")
+        self.assertEqual(results["show module"]["status"], "OK")
+        self.assertEqual(results["show module"]["retries"], 1)
+        self.assertIn("missing prompt", results["show module"]["timeout_errors"][0])
+        self.assertIn("reconnect 1/3", diagnostics["session_log"])
+        first.disconnect.assert_called_once()
+        second.disconnect.assert_called_once()
+
+    @patch.object(common, "ConnectHandler")
+    def test_exhausted_command_budget_skips_failed_command_on_another_fresh_connection(self, connect):
+        sessions = [MagicMock() for _ in range(3)]
+        sessions[0].send_command.side_effect = common.ReadTimeout("first timeout")
+        sessions[1].send_command.side_effect = common.ReadTimeout("second timeout")
+        sessions[2].send_command.return_value = "next command output"
+        connect.side_effect = sessions
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=("show module", "show vpc"),
+                                               reconnects_per_command=1, reconnects_per_switch=2)
+        self.assertEqual(results["show module"]["status"], "ERROR")
+        self.assertEqual(len(results["show module"]["timeout_errors"]), 2)
+        self.assertEqual(results["show vpc"]["status"], "OK")
+        self.assertEqual(sessions[2].send_command.call_args.args[0], "show vpc")
+        for session in sessions:
+            session.disconnect.assert_called_once()
+
+    @patch.object(common, "ConnectHandler")
+    def test_switch_budget_caps_reconnections_across_multiple_commands(self, connect):
+        first, second = MagicMock(), MagicMock()
+        first.send_command.side_effect = common.ReadTimeout("first timeout")
+        second.send_command.side_effect = ["retried output", common.ReadTimeout("next timeout")]
+        connect.side_effect = [first, second]
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=("show module", "show vpc", "show version"),
+                                               reconnects_per_command=4, reconnects_per_switch=1)
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual(results["show module"]["status"], "OK")
+        self.assertEqual(results["show vpc"]["status"], "ERROR")
+        self.assertIn("Not attempted", results["show version"]["output"])
+
+    @patch.object(common, "ConnectHandler")
+    def test_zero_command_budget_skips_without_retry_and_reconnect_failure_stops(self, connect):
+        first, second = MagicMock(), MagicMock()
+        first.send_command.side_effect = common.ReadTimeout("timeout")
+        second.send_command.return_value = "next output"
+        connect.side_effect = [first, second]
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=("show module", "show vpc"),
+                                               reconnects_per_command=0, reconnects_per_switch=1)
+        self.assertEqual(second.send_command.call_args.args[0], "show vpc")
+        self.assertEqual(results["show module"]["status"], "ERROR")
+        connect.side_effect = [first, common.NetmikoAuthenticationException("rejected")]
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=("show module", "show vpc"))
+        self.assertIn("timeout", results["show module"]["timeout_errors"][0])
+        self.assertIn("Reconnect failed", results["show module"]["error"])
+        self.assertIn("rejected", results["show vpc"]["output"])
+
+    @patch.object(common, "ConnectHandler")
+    def test_cancel_after_timeout_prevents_reconnect_and_invalid_budgets_prevent_login(self, connect):
+        event = threading.Event()
+        def timeout(*args, **kwargs):
+            event.set()
+            raise common.ReadTimeout("timeout")
+        connect.return_value.send_command.side_effect = timeout
+        with self.assertRaises(common.CaptureCancelled):
+            common.capture_leaf_commands("switch", "user", "synthetic",
+                                        commands=("show module",), cancel_event=event)
+        connect.assert_called_once()
+        connect.reset_mock()
+        for limit in (-1, 1.5, None, True, float("nan"), float("inf")):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                common.capture_leaf_commands("switch", "user", "synthetic", reconnects_per_switch=limit)
+        connect.assert_not_called()
+
     @patch.object(common, "ConnectHandler")
     def test_read_timeout_stops_remaining_commands_and_disconnects(self, connect):
         session = connect.return_value
         session.send_command.side_effect = ["first output", common.ReadTimeout("Prompt not detected")]
         commands = ("show version", "show module", "show vpc", "show port-channel summary")
-        results = common.capture_leaf_commands("switch", "user", "synthetic", commands=commands)
+        results = common.capture_leaf_commands("switch", "user", "synthetic", commands=commands,
+                                               reconnects_per_switch=0)
         self.assertEqual(session.send_command.call_count, 2)
         self.assertEqual(results["show version"]["status"], "OK")
         self.assertIn("ReadTimeout: Prompt not detected", results["show module"]["output"])
         for command in commands[2:]:
             self.assertEqual(results[command]["status"], "ERROR")
             self.assertIn("Not attempted", results[command]["output"])
-            self.assertIn("show module", results[command]["output"])
+            self.assertIn("maximum reconnects per switch", results[command]["output"])
         session.disconnect.assert_called_once()
 
     @patch("aci_checks.capture_leaf_commands")

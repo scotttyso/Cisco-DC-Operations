@@ -705,6 +705,11 @@ def aci_panel(apic_selector):
                 workers = ui.number("Parallel switches", value=20, min=1, max=32, precision=0).props("outlined dense")
                 connect_timeout = ui.number("SSH connection timeout (seconds)", value=20, min=1, precision=0).props("outlined dense")
                 read_timeout = ui.number("Per-command timeout (seconds)", value=90, min=1, precision=0).props("outlined dense")
+                command_reconnects = ui.number("Maximum reconnects per command", value=1, min=0, precision=0).props("outlined dense")
+                switch_reconnects = ui.number("Maximum reconnects per switch", value=3, min=0, precision=0).props("outlined dense")
+            ui.label("Timeouts close SSH before retrying. Per-command limits cap retries of that command; "
+                     "the switch limit caps all new connections after the initial login, including connections "
+                     "needed to skip a failed command. Set the switch limit to 0 to stop after a timeout.").classes("muted")
             ssh_diagnostics = ui.checkbox("Record SSH diagnostics (password-redacted)", value=False)
             ui.label("Opt-in per run. Transcripts include switch output and login identity, including partial "
                      "output on timeout, and are saved in shared ACI reports. They may contain sensitive "
@@ -811,7 +816,9 @@ def aci_panel(apic_selector):
                                 connect_timeout=int(connect_timeout.value), read_timeout=int(read_timeout.value),
                                 notify=messages.put, role=capture_role.value, dns_domain=STORE.dns_domain(),
                                 role_commands=command_values() if before is None else None, jump=jump,
-                                cancel_event=cancel_event, ssh_diagnostics=bool(ssh_diagnostics.value))
+                                cancel_event=cancel_event, ssh_diagnostics=bool(ssh_diagnostics.value),
+                                reconnects_per_command=command_reconnects.value,
+                                reconnects_per_switch=switch_reconnects.value)
                 cancel_event.clear()
                 run_button.disable()
                 cancel_button.enable()

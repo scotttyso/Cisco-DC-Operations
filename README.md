@@ -176,10 +176,20 @@ avoid rerunning queries recorded in an existing baseline.
 APIC/SSH operations finish or reach their configured timeout before connections
 are closed. The run controls remain disabled during cleanup; a cancelled run
 does not save a completed snapshot.
-If a direct SSH command raises Netmiko `ReadTimeout`, capture stops sending
-commands to that switch and closes the connection. Remaining checks are reported
-as errors with a **Not attempted** explanation; they never count as matches.
-Other switches continue normally.
+On an SSH command timeout, capture closes the connection before any further
+command. **Maximum reconnects per command** (default 1) caps retries of that
+command; **Maximum reconnects per switch** (default 3) caps all reconnects across
+the run for that switch, excluding the initial login. A failed command is retried
+on a fresh session without rerunning earlier successful commands. If its retry
+limit is reached, it remains an error and the next command is attempted on a
+fresh session only if the switch budget permits. That fresh connection also
+counts against the switch limit. A switch limit of 0 restores stop-on-timeout
+behavior; a command limit of 0 skips timed-out commands without retrying them.
+Remaining checks are **Not attempted** when the switch budget runs out. A
+reconnect/login failure stops further commands rather than repeatedly trying
+credentials. Direct and ND-jump SSH use these limits; cancellation stops retries.
+Capture logs and optional diagnostics record retries, and command results retain
+timeout history even after a successful retry. Other switches continue normally.
 
 For SSH/prompt troubleshooting, enable **Capture settings → Record SSH diagnostics
 (password-redacted)** before running a capture (preferably for one node).

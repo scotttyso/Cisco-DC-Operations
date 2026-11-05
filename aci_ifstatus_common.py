@@ -328,13 +328,25 @@ def fqdn(host: str, dns_domain: str = "") -> str:
     return h if not h or "." in h or ":" in h or not suffix else h + "." + suffix
 
 
+def validate_reconnect_limits(per_command: int | float, per_switch: int | float) -> tuple[int, int]:
+    for label, value in (("command", per_command), ("switch", per_switch)):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0
+                or isinstance(value, float) and not value.is_integer()):
+            raise ValueError(f"Maximum reconnects per {label} must be a non-negative integer")
+    return int(per_command), int(per_switch)
+
+
 def capture_leaf_commands(target: str, username: str, password: str,
                           connect_timeout: int = 20, read_timeout: int = 90,
                           commands: tuple[str, ...] = DIAGNOSTIC_COMMANDS,
                           jump: dict | None = None,
                           cancel_event: threading.Event | None = None,
-                          diagnostics: dict | None = None) -> dict[str, dict]:
-    """Capture guarded read-only commands through one SSH session, retaining failures."""
+                          diagnostics: dict | None = None,
+                          reconnects_per_command: int = 1, reconnects_per_switch: int = 3,
+                          notify: Callable[[str], None] = lambda message: None) -> dict[str, dict]:
+    """Capture guarded commands, reconnecting within bounded timeout retry budgets."""
+    reconnects_per_command, reconnects_per_switch = validate_reconnect_limits(
+        reconnects_per_command, reconnects_per_switch)
     for command in commands:
         assert_read_only(command)
     check_capture_cancelled(cancel_event)
@@ -349,21 +361,65 @@ def capture_leaf_commands(target: str, username: str, password: str,
         f"Connection method: {'Nexus Dashboard jump' if jump else 'Netmiko direct'}",
         f"Connect timeout: {connect_timeout}s | Command timeout: {read_timeout}s",
     ]
-    try:
+    def connect():
         if jump:
             from aci_jump import NexusDashboardSSH
-            conn = NexusDashboardSSH(target, username, password, jump, connect_timeout,
-                                     diagnostic_log=jump_buffer)
+            connection = NexusDashboardSSH(target, username, password, jump, connect_timeout,
+                                           diagnostic_log=jump_buffer)
         else:
-            conn = ConnectHandler(
+            connection = ConnectHandler(
                 device_type="cisco_nxos", host=target, username=username, password=password,
                 conn_timeout=connect_timeout, auth_timeout=connect_timeout,
                 banner_timeout=connect_timeout, fast_cli=False, session_log=session_log,
             )
         if diagnostics is not None:
-            prompt = conn.session.sw_prompt_re if jump else conn.base_prompt
+            prompt = connection.session.sw_prompt_re if jump else connection.base_prompt
             diagnostic_lines.append(f"Detected base prompt/pattern (repr): {prompt!r}")
-        for index, command in enumerate(commands):
+        return connection
+
+    def close_connection():
+        nonlocal conn
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.disconnect()
+            conn = None
+
+    index, reconnects = 0, 0
+    retries = {command: 0 for command in commands}
+    timeout_errors = {command: [] for command in commands}
+    try:
+        conn = connect()
+        while index < len(commands):
+            check_capture_cancelled(cancel_event)
+            command = commands[index]
+            if conn is None:
+                if reconnects >= reconnects_per_switch:
+                    reason = "Not attempted: maximum reconnects per switch reached after SSH timeout"
+                    for remaining in commands[index:]:
+                        results[remaining] = {"status": "ERROR", "output": reason}
+                    notify(f"{target}: {reason}")
+                    break
+                reconnects += 1
+                message = f"{target}: reconnect {reconnects}/{reconnects_per_switch}; resuming {command}"
+                notify(message)
+                if diagnostics is not None:
+                    diagnostic_lines.append(message)
+                try:
+                    conn = connect()
+                except CaptureCancelled:
+                    raise
+                except Exception as exc:
+                    reason = f"Reconnect failed: {type(exc).__name__}: {exc}"
+                    for secret in (password, (jump or {}).get("password", "")):
+                        if secret:
+                            reason = reason.replace(secret, "[REDACTED]")
+                    for remaining in commands[index:]:
+                        results.setdefault(remaining, {"status": "ERROR", "output": reason})
+                        results[remaining]["error"] = reason
+                    notify(f"{target}: {reason}")
+                    if diagnostics is not None:
+                        diagnostic_lines.append(reason)
+                    break
             check_capture_cancelled(cancel_event)
             if diagnostics is not None:
                 diagnostic_lines.append(f"Command: {command}")
@@ -387,25 +443,31 @@ def capture_leaf_commands(target: str, username: str, password: str,
                 raise
             except ReadTimeout as exc:
                 results[command] = {"status": "ERROR", "output": f"{type(exc).__name__}: {exc}"}
-                reason = f"Not attempted: SSH session lost synchronization after ReadTimeout in {command}"
-                for remaining in commands[index + 1:]:
-                    results[remaining] = {"status": "ERROR", "output": reason}
+                timeout_errors[command].append(results[command]["output"])
+                close_connection()
+                notify(f"{target}: ReadTimeout in {command}; SSH closed")
                 if diagnostics is not None:
                     diagnostic_lines.append(f"Command error: {type(exc).__name__}: {exc}")
-                    diagnostic_lines.append(reason + "; stopping further commands and closing SSH")
-                break
+                    diagnostic_lines.append("SSH closed after timeout")
+                results[command]["timeout_errors"] = list(timeout_errors[command])
+                if retries[command] < reconnects_per_command and reconnects < reconnects_per_switch:
+                    retries[command] += 1
+                    continue
+                notify(f"{target}: skipping {command}; command or switch reconnect limit reached")
             except Exception as exc:
                 results[command] = {"status": "ERROR", "output": f"{type(exc).__name__}: {exc}"}
                 if diagnostics is not None:
                     diagnostic_lines.append(f"Command error: {type(exc).__name__}: {exc}")
+            if timeout_errors[command]:
+                results[command]["timeout_errors"] = list(timeout_errors[command])
+                results[command]["retries"] = retries[command]
+            index += 1
     except Exception as exc:
         if diagnostics is not None:
             diagnostic_lines.append(f"Session error: {type(exc).__name__}: {exc}")
         raise
     finally:
-        if conn is not None:
-            with contextlib.suppress(Exception):
-                conn.disconnect()
+        close_connection()
         if diagnostics is not None:
             if session_log is not None:
                 session_log.close()

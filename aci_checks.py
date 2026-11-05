@@ -18,6 +18,7 @@ from aci_ifstatus_common import (
     aci_login_username, capture_leaf_commands, check_capture_cancelled, command_label,
     discover_active_nodes, fqdn, moquery_attributes, parse_interface_brief, validate_role_commands,
     upgraded_role_commands,
+    validate_reconnect_limits,
 )
 from aci_leaf_ifstatus_post import compare
 
@@ -46,7 +47,10 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                      dns_domain: str = "", notify=lambda message: None,
                      role: str = "all", role_commands: dict | None = None,
                      jump: dict | None = None, cancel_event: threading.Event | None = None,
-                     ssh_diagnostics: bool = False) -> dict:
+                     ssh_diagnostics: bool = False, reconnects_per_command: int = 1,
+                     reconnects_per_switch: int = 3) -> dict:
+    reconnects_per_command, reconnects_per_switch = validate_reconnect_limits(
+        reconnects_per_command, reconnects_per_switch)
     check_capture_cancelled(cancel_event)
     if role not in ("all", "leaf", "spine"):
         raise ValueError("Select all switches, leaf, or spine")
@@ -84,7 +88,9 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                 raise ValueError("Switch has no OOB address or name")
             return capture_leaf_commands(target, username, password, connect_timeout, read_timeout,
                                          commands=command_lists[leaf.get("role", "leaf")],
-                                         jump=jump, cancel_event=cancel_event, diagnostics=diagnostics)
+                                         jump=jump, cancel_event=cancel_event, diagnostics=diagnostics,
+                                         reconnects_per_command=reconnects_per_command,
+                                         reconnects_per_switch=reconnects_per_switch, notify=notify)
 
         try:
             with auth_lock:
@@ -129,6 +135,7 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
             "phase": "post" if baseline else "pre", "baseline_id": baseline["id"] if baseline else None,
             "captured_at": datetime.now(timezone.utc).isoformat(), "group": group, "role": role,
             "role_commands": command_lists, "dns_domain": dns_domain,
+            "reconnects_per_command": reconnects_per_command, "reconnects_per_switch": reconnects_per_switch,
             "ssh_connection": "nexus_dashboard" if jump else "direct", "nodes": entries}
 
 
