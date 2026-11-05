@@ -12,6 +12,7 @@ import os
 import queue
 import requests
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,8 @@ from nicegui import app, run, ui
 
 from aci_checks import (ATTENTION_STATES, capture_snapshot, delete_old_snapshots, filter_results, load_snapshots,
                         save_snapshot, snapshot_results, summarize_results)
-from aci_ifstatus_common import DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, validate_role_commands
+from aci_ifstatus_common import (DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, CaptureCancelled,
+                               check_capture_cancelled, command_label, validate_role_commands)
 from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
 from nxos_jobs import NXJob, nd_switch_selection
 from nd_interfaces import InterfaceDescriptions, filter_interface_rows, nd_helpers, validate_description
@@ -84,7 +86,7 @@ body.body--dark {background:var(--workspace);color:var(--ink);}
 .summary-banner {width:100%;border-left:4px solid var(--accent);padding:10px 14px;background:var(--surface);}
 .filter-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:100%;}
 .dialog {width:640px;max-width:94vw;border-radius:4px;}
-.report-dialog {width:1100px;max-width:96vw;max-height:92vh;}
+.report-dialog {width:1100px;max-width:96vw;max-height:92vh;overflow-y:auto;}
 pre {white-space:pre-wrap;overflow-wrap:anywhere;}
 @media(max-width:700px) {.workspace {padding:20px 14px;}.form-grid,.filter-grid {grid-template-columns:1fr;}
  .brand {font-size:16px;}.account {display:none;}.q-tab-panel {padding-top:18px;}.heading {font-size:22px;}
@@ -184,10 +186,39 @@ def password_dialog():
     dialog.open()
 
 
+def aci_command_outputs_dialog(rows: list[dict], command: str, phase: str):
+    owner()
+    selected = sorted((row for row in rows if row["command"] == command),
+                      key=lambda row: int(row["node_id"]))
+    if not selected:
+        ui.notify("No outputs for this command in the selected report", type="warning")
+        return
+    with ui.dialog() as dialog, ui.card().classes("report-dialog"):
+        with ui.row().classes("w-full items-center"):
+            ui.label(f"{command_label(command)} | All {len(selected)} switches").classes("section-title")
+            ui.space()
+            ui.button(icon="close", on_click=dialog.close).props(
+                'flat round aria-label="Close command outputs"').tooltip("Close command outputs")
+        ui.label("Includes all switches in this report, regardless of findings filters. "
+                 "Each output is limited to 60,000 characters; download the report for full data.").classes("muted")
+        with ui.tabs().classes("w-full") as tabs:
+            for label in ("Difference", "Pre", "Post"):
+                ui.tab(label)
+        with ui.tab_panels(tabs, value="Pre" if phase == "pre" else "Difference").classes("w-full overflow-y-auto"):
+            for label, field in (("Difference", "detail"), ("Pre", "pre"), ("Post", "post")):
+                with ui.tab_panel(label):
+                    for row in selected:
+                        ui.label(f"Node {row['node_id']} | {row['name']} | {row.get('role', 'leaf')} | {row['state']}").classes("section-title")
+                        text = row.get(field) or ("No differences" if field == "detail" and row["state"] == "MATCH"
+                                                  else "No output")
+                        ui.code(text[:60000], language="diff" if field == "detail" else "text").classes("w-full")
+    dialog.open()
+
+
 def users_dialog():
     actor = owner()
     accounts = STORE.users(actor)
-    with ui.dialog() as dialog, ui.card().classes("dialog"):
+    with ui.dialog() as dialog, ui.card().classes("dialog max-h-[90vh] overflow-y-auto"):
         with ui.row().classes("w-full items-center"):
             ui.label("User accounts").classes("section-title")
             ui.space()
@@ -213,6 +244,8 @@ def users_dialog():
                 await run.io_bound(STORE.create_user, current_actor, username.value or "", secret, role.value)
                 table.rows = STORE.users(owner())
                 table.update()
+                reset_username.set_options([account["username"] for account in table.rows
+                                            if account["username"] != current_actor])
                 username.value = ""
                 ui.notify("User created", type="positive")
             except ValueError as error:
@@ -221,6 +254,34 @@ def users_dialog():
                 create_button.enable()
 
         create_button = ui.button("Create user", icon="person_add", on_click=create)
+        ui.label("Reset another user's password").classes("section-title mt-4")
+        ui.label("Local WebUI accounts only. Corporate passwords are managed by the identity provider. "
+                 "Saved device credentials are preserved; all sessions for the selected user must sign in again.").classes("muted")
+        reset_username = ui.select([account["username"] for account in accounts if account["username"] != actor],
+                                   label="User account").props("outlined").classes("w-full")
+        reset_new = ui.input("New password", password=True, password_toggle_button=True).props(
+            "outlined autocomplete=new-password").classes("w-full")
+        reset_confirmation = ui.input("Confirm new password", password=True, password_toggle_button=True).props(
+            "outlined autocomplete=new-password").classes("w-full")
+
+        async def reset():
+            try:
+                current_actor = owner()
+                target = reset_username.value or ""
+                values = (reset_new.value or "", reset_confirmation.value or "")
+                reset_new.value = reset_confirmation.value = ""
+                if not target:
+                    raise ValueError("Select a user account to reset")
+                reset_button.disable()
+                await run.io_bound(STORE.reset_password, current_actor, target, *values)
+                dialog.close()
+                ui.notify(f"Password reset for {target}; all their sessions must sign in again", type="positive")
+            except ValueError as error:
+                notify_error(error)
+            finally:
+                reset_button.enable()
+
+        reset_button = ui.button("Reset password", icon="lock_reset", on_click=reset)
     dialog.open()
 
 
@@ -606,6 +667,7 @@ def aci_panel(apic_selector):
     snapshots = {}
     baseline_options = {}
     command_fields = {}
+    cancel_event = threading.Event()
 
     def selected_apic():
         return next((profile for profile in STORE.apics() if profile["id"] == apic_selector.value), None)
@@ -692,7 +754,12 @@ def aci_panel(apic_selector):
             leaf_section.set_visibility(bool(affected))
             node_filter.set_options({leaf["node_id"]: f"{leaf['node_id']} | {leaf['role']} | {leaf['name']}"
                                      for leaf in summary["leaves"]}, value=None)
-            command_filter.set_options(list(dict.fromkeys(row["command"] for row in rows)), value=None)
+            command_filter.set_options({row["command"]: command_label(row["command"]) for row in rows}, value=None)
+            aggregate_links.clear()
+            with aggregate_links:
+                for command in dict.fromkeys(row["command"] for row in rows):
+                    ui.button(command_label(command), on_click=lambda selected=command: aci_command_outputs_dialog(
+                        all_results, selected, current_snapshot["phase"])).props("flat no-caps")
             role_filter.value = None
             search.value = ""
             result_filter.value = "attention" if snapshot["phase"] == "post" else "all"
@@ -736,8 +803,11 @@ def aci_panel(apic_selector):
                 settings = dict(group=group.value, node_ids=node_ids.value or "", workers=int(workers.value),
                                 connect_timeout=int(connect_timeout.value), read_timeout=int(read_timeout.value),
                                 notify=messages.put, role=capture_role.value, dns_domain=STORE.dns_domain(),
-                                role_commands=command_values() if before is None else None, jump=jump)
+                                role_commands=command_values() if before is None else None, jump=jump,
+                                cancel_event=cancel_event)
+                cancel_event.clear()
                 run_button.disable()
+                cancel_button.enable()
                 apic_selector.disable()
                 progress.text = "Capturing diagnostic commands..."
                 log.clear()
@@ -745,6 +815,7 @@ def aci_panel(apic_selector):
                 def work():
                     snapshot = capture_snapshot({**profile, "domain": values["domain"]}, values["username"], values["password"], baseline=before, **settings)
                     snapshot = json.loads(redact(json.dumps(snapshot), values))
+                    check_capture_cancelled(cancel_event)
                     save_snapshot(directory, snapshot)
                     return snapshot
 
@@ -753,6 +824,10 @@ def aci_panel(apic_selector):
                 refresh_history()
                 history.value = snapshot["id"]
                 show_snapshot(snapshot)
+            except CaptureCancelled:
+                progress.text = "ACI capture cancelled; no snapshot saved"
+                log.push("ACI capture cancelled; no snapshot saved")
+                ui.notify("ACI capture cancelled; no snapshot saved", type="warning")
             except Exception as error:
                 notify_error(error, values)
                 progress.text = "Capture did not complete"
@@ -761,10 +836,20 @@ def aci_panel(apic_selector):
                 if jump:
                     jump.clear()
                 run_button.enable()
+                cancel_button.disable()
                 apic_selector.enable()
+
+        def cancel_capture():
+            owner()
+            cancel_event.set()
+            cancel_button.disable()
+            progress.text = "Cancelling ACI capture; waiting for in-flight commands to finish..."
+            log.push("Cancellation requested; no more switches or commands will be started")
 
         with ui.row().classes("w-full items-center"):
             run_button = ui.button("Run ACI checks", icon="play_arrow", on_click=capture)
+            cancel_button = ui.button("Cancel ACI checks", icon="stop", on_click=cancel_capture).props("outline")
+            cancel_button.disable()
         with ui.column().classes("section gap-4"):
             with ui.row().classes("w-full items-center"):
                 ui.label("Capture history").classes("section-title")
@@ -800,6 +885,8 @@ def aci_panel(apic_selector):
                 ui.button("View switch findings", icon="filter_alt", on_click=focus_leaf).props("outline")
             leaf_section.set_visibility(False)
             ui.label("Command findings").classes("section-title")
+            ui.label("All-switch outputs: open any command to see every switch together.").classes("muted")
+            aggregate_links = ui.row().classes("w-full flex-wrap")
             with ui.element("div").classes("filter-grid"):
                 result_filter = ui.select({"attention": "Needs investigation", "all": "All results",
                                            "REVIEW": "REVIEW - changed output", "ERROR": "ERROR - check failed",
@@ -808,12 +895,14 @@ def aci_panel(apic_selector):
                                           value="attention", label="Result").props("outlined dense")
                 role_filter = ui.select({"leaf": "Leaf", "spine": "Spine"}, label="Role", clearable=True).props("outlined dense")
                 node_filter = ui.select({}, label="Switch", clearable=True, with_input=True).props("outlined dense")
-                command_filter = ui.select(list(DIAGNOSTIC_COMMANDS), label="Command", clearable=True).props("outlined dense")
+                command_filter = ui.select({command: command_label(command) for command in DIAGNOSTIC_COMMANDS},
+                                           label="Command", clearable=True).props("outlined dense")
             help_text = ui.label("Changed output, failed captures, and missing PRE data require investigation.").classes("muted")
             search = ui.input("Search findings", placeholder="Switch name, node ID, command, or reason").props("outlined dense clearable").classes("w-full")
             visible_count = ui.label("0 command results").classes("muted")
             table = ui.table(columns=[
-                {"name": name, "label": label, "field": name, "align": "left", "sortable": True}
+                {"name": name, "label": label, "field": "command_label" if name == "command" else name,
+                 "align": "left", "sortable": True}
                 for name, label in (("node_id", "Node"), ("name", "Switch"), ("role", "Role"), ("command", "Command"),
                                     ("state", "Result"), ("context", "Context"))
             ], rows=[], row_key="id", selection="single", pagination=15).classes("w-full")
@@ -828,7 +917,7 @@ def aci_panel(apic_selector):
                 row = next(result for result in all_results if result["id"] == table.selected[0]["id"])
                 with ui.dialog() as dialog, ui.card().classes("report-dialog"):
                     with ui.row().classes("w-full items-center"):
-                        ui.label(f"Node {row['node_id']} | {row['command']} | {row['state']}").classes("section-title")
+                        ui.label(f"Node {row['node_id']} | {command_label(row['command'])} | {row['state']}").classes("section-title")
                         ui.space()
                         ui.button(icon="close", on_click=dialog.close).props('flat round aria-label="Close report"').tooltip("Close report")
                     with ui.tabs().classes("w-full") as detail_tabs:
@@ -886,6 +975,7 @@ def aci_panel(apic_selector):
     def apic_changed():
         current_snapshot.clear()
         all_results.clear()
+        aggregate_links.clear()
         headline.text = "No snapshot selected"
         for label in metrics.values():
             label.text = "0"

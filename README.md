@@ -58,8 +58,13 @@ at least 12 characters, and confirmation. Saved device credentials are preserved
 Other browser/device sessions must sign in again on their next protected action.
 
 Administrators also have **User accounts**, where they can create operator or
-administrator accounts. Operators can run automation and manage APIC inventory,
-but cannot create users. Duplicate usernames are rejected, not overwritten.
+administrator accounts and **Reset password** for another local WebUI account.
+A reset requires a different password of at least 12 characters and confirmation,
+but not the user's current password. It preserves their role, preferences, and
+saved device credentials, and invalidates all their existing sessions.
+Corporate OIDC passwords must be changed through the identity provider.
+Operators can run automation and manage APIC inventory, but cannot create users
+or reset other users' passwords. Duplicate usernames are rejected, not overwritten.
 Create the initial administrator with the local `--create-user` command shown
 above. That command can also reset an existing account's password without
 changing its role. It invalidates existing sessions for that account.
@@ -126,7 +131,7 @@ fallback behavior. Review these policies for production. It opens one ND SSH
 session per captured switch and serializes unproven logins until one succeeds;
 an initial authentication rejection stops further attempts in that run.
 Passwords are not put in SSH command arguments, global environment variables,
-snapshots, or session logs. Commands remain guarded `show` commands; only temporary
+snapshots, or session logs. Commands remain guarded read-only commands; only temporary
 CLI paging/width settings are sent for capture. Both hops are closed afterward.
 The jump path has mock coverage but has not been certified against live ND/ACI.
 
@@ -140,7 +145,7 @@ show interface brief
 show environment
 show module
 show lldp neighbor
-show isis adjacency vrf all
+moquery -c isisAdjEp -o json
 ```
 
 These defaults run on leaf switches only:
@@ -149,15 +154,24 @@ These defaults run on leaf switches only:
 show vpc
 show port-channel summary
 show endpoint summary
-show mac address-table dynamic | egrep -v tun
+moquery -c epmMacEp -f 'epm.MacEp.flags*"local"' -o json
 ```
 
 **Commands by role** contains separate leaf/spine lists, one command per line.
 Additional guarded `show` commands can be entered and saved per APIC using
-**Save role commands**. Non-show commands, redirection, chaining, and arbitrary
+**Save role commands**. Only the two exact `moquery` commands above are allowed
+in addition to guarded `show` commands. Other non-show commands, redirection, chaining, and arbitrary
 pipelines are rejected. The known leaf-only command families cannot be assigned
 to spines. Custom show commands may be expensive or expose sensitive data; test
 on one switch and review command support before running them fabric-wide.
+Saved command lists automatically replace the two former MAC/IS-IS show defaults
+for new PRE captures. POST captures retain the commands from their PRE baseline,
+including legacy show commands, so an older baseline remains comparable.
+
+**Cancel ACI checks** stops queued switches and subsequent commands. In-flight
+APIC/SSH operations finish or reach their configured timeout before connections
+are closed. The run controls remain disabled during cleanup; a cancelled run
+does not save a completed snapshot.
 
 Each new PRE snapshot records its role-command lists. POST reuses those recorded
 lists even if the saved configuration has since changed. Existing snapshots
@@ -165,9 +179,10 @@ without role metadata are treated as leaf-only; capture a new PRE including
 spines before comparing spine results. The legacy interface-only CLI remains
 leaf-only and does not use WebUI profiles or role-command settings.
 
-`show isis adjacency vrf all` is one command, not a newline-separated sequence.
-Only the exact MAC-table filter above is allowed; arbitrary pipelines and
-chaining remain blocked. Unsupported commands are retained as errors for review;
+Each query above is one complete command, including its quotes where shown.
+Arbitrary pipelines and chaining remain blocked. The former exact MAC-table
+pipeline remains allowed only for compatibility with legacy baselines.
+Unsupported commands are retained as errors for review;
 ACI release/platform syntax has not been verified against live hardware here.
 
 1. Select **PRE baseline**, **Leaf and spine**, and **All node IDs**, then run the checks before upgrading.
@@ -192,8 +207,31 @@ older saved PRE snapshots, without rerunning any device commands.
 Interface results compare normalized physical-port up/down status, including
 missing ports. `show environment` compares supply/module/fan identity, model, and
 status; output watts, draw, capacity, and total-power values are ignored.
-`show isis adjacency vrf all` compares neighbor system ID, interface, and state;
-hold time, SNPA, and level are ignored. Other commands use whitespace-trimmed,
+`show module` compares only the first module inventory/status table: module IDs,
+port counts, module types, models, and statuses. Supervisor Module and System
+Controller `active`/`standby` role swaps are ignored; other status changes still
+require review. All later tables, including software/hardware versions and serial
+numbers, are ignored in the comparison. Full raw output remains available.
+This applies to both fixed 1-RU switches and modular chassis.
+The MAC `moquery` compares `addr` and `dn`, ignoring records whose `ifId` contains
+`tunnel` (case-insensitive). Other attributes and record ordering are ignored.
+Its command label includes **(show mac add dyn)** for recognition.
+The IS-IS `moquery` compares neighbor `sysId` (or `name` if unavailable) and
+`operSt`, including duplicate-neighbor counts. Timestamps, interface/DN changes,
+and other attributes are ignored. Invalid JSON or incomplete output where
+`totalCount` does not match `imdata` is not treated as a match; full raw output
+is retained for investigation. Legacy `show isis adjacency vrf all` baselines
+still compare neighbor system IDs and states, ignoring interface renumbering.
+`show port-channel summary` matches channels by their physical member interfaces,
+ignoring group/channel IDs and row/member ordering. Member flags, channel flags,
+type, protocol, and membership changes still require review.
+`show vpc` uses each capture's `show port-channel summary` to match vPCs by
+physical members, ignoring vPC IDs and port-channel renumbering. Status,
+consistency, reason (including wrapped lines), and active VLANs are compared;
+global/peer-link output is also retained in the comparison. An unavailable or
+ambiguous physical-member mapping is an **ERROR**, not a guessed match.
+Include both commands in custom leaf command lists for this comparison.
+Other commands use whitespace-trimmed,
 order-sensitive text diffs. **REVIEW** means output changed, not necessarily that
 the device is unhealthy. **ERROR** and **NO_BASELINE** never count as a match.
 There is no automatic health verdict for the extra commands. The viewer limits
@@ -206,6 +244,13 @@ with separate leaf/spine counts. Several changed/failed commands on one switch
 count as one affected switch. **Switches to investigate** lists node IDs, names, roles, changed-check
 counts, capture errors, missing baselines, and contextual reasons. Select a leaf
 and choose **View switch findings** to narrow its command findings.
+
+Each report also provides **All-switch outputs** command links. Open a command
+once to see every switch's **Difference**, **Pre**, or **Post** output together,
+ordered by node ID and labeled with switch name, role, and result. These views
+include every switch in the report regardless of the findings filters; the
+existing individual **Inspect result** view remains available.
+Long individual and aggregate report dialogs scroll vertically within the viewport.
 
 POST reports default to **Result = Needs investigation**, showing only `REVIEW`,
 `ERROR`, and `NO_BASELINE` findings. Choose **REVIEW - changed output** for an

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -13,8 +14,10 @@ from uuid import uuid4
 from netmiko.exceptions import NetmikoAuthenticationException
 
 from aci_ifstatus_common import (
-    COMMAND, ROLE_COMMANDS, ApicClient, aci_login_username, capture_leaf_commands,
-    discover_active_nodes, fqdn, parse_interface_brief, validate_role_commands,
+    COMMAND, MAC_QUERY, ISIS_QUERY, LEGACY_MAC_COMMAND, LEGACY_ISIS_COMMAND, ROLE_COMMANDS, ApicClient, CaptureCancelled,
+    aci_login_username, capture_leaf_commands, check_capture_cancelled, command_label,
+    discover_active_nodes, fqdn, moquery_attributes, parse_interface_brief, validate_role_commands,
+    upgraded_role_commands,
 )
 from aci_leaf_ifstatus_post import compare
 
@@ -42,10 +45,12 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                      connect_timeout: int = 20, read_timeout: int = 90,
                      dns_domain: str = "", notify=lambda message: None,
                      role: str = "all", role_commands: dict | None = None,
-                     jump: dict | None = None) -> dict:
+                     jump: dict | None = None, cancel_event: threading.Event | None = None) -> dict:
+    check_capture_cancelled(cancel_event)
     if role not in ("all", "leaf", "spine"):
         raise ValueError("Select all switches, leaf, or spine")
-    command_lists = validate_role_commands(baseline.get("role_commands") if baseline else role_commands)
+    command_lists = (validate_role_commands(baseline_role_commands(baseline)) if baseline
+                     else upgraded_role_commands(role_commands))
     username = aci_login_username(username, apic.get("domain", "local"))
     if baseline:
         if baseline["apic_id"] != apic["id"] or baseline["apic"] != apic["address"]:
@@ -55,9 +60,11 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
         client = ApicClient(apic["address"], verify_tls=bool(apic["verify_tls"]))
         try:
             client.login(username, password)
+            check_capture_cancelled(cancel_event)
             leaves = discover_active_nodes(client)
         finally:
             client.logout()
+    check_capture_cancelled(cancel_event)
     leaves = select_leaves([node for node in leaves if role == "all" or node.get("role", "leaf") == role], group, node_ids)
     auth_lock = threading.Lock()
     auth_ok = threading.Event()
@@ -70,15 +77,16 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
         entry = {"leaf": leaf, "target": target, "commands": {}, "error": ""}
 
         def capture():
+            check_capture_cancelled(cancel_event)
             if not target:
                 raise ValueError("Switch has no OOB address or name")
-            options = {"commands": command_lists[leaf.get("role", "leaf")]}
-            if jump:
-                options["jump"] = jump
-            return capture_leaf_commands(target, username, password, connect_timeout, read_timeout, **options)
+            return capture_leaf_commands(target, username, password, connect_timeout, read_timeout,
+                                         commands=command_lists[leaf.get("role", "leaf")],
+                                         jump=jump, cancel_event=cancel_event)
 
         try:
             with auth_lock:
+                check_capture_cancelled(cancel_event)
                 if auth_bad.is_set():
                     raise NetmikoAuthenticationException("Skipped: unproven password rejected by another leaf")
                 if not auth_ok.is_set():
@@ -90,6 +98,9 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                     auth_ok.set()
             if not entry["commands"]:
                 entry["commands"] = capture()
+            check_capture_cancelled(cancel_event)
+        except CaptureCancelled:
+            raise
         except Exception as exc:
             entry["error"] = f"{type(exc).__name__}: {exc}"
         notify(f"{leaf.get('role', 'leaf').upper()} {leaf['node_id']} {leaf['name']}: "
@@ -100,8 +111,15 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
     entries = []
     with ThreadPoolExecutor(max_workers=max(1, min(32, workers))) as executor:
         futures = [executor.submit(collect, leaf) for leaf in leaves]
-        for future in as_completed(futures):
-            entries.append(future.result())
+        try:
+            for future in as_completed(futures):
+                check_capture_cancelled(cancel_event)
+                entries.append(future.result())
+        except CaptureCancelled:
+            for future in futures:
+                future.cancel()
+            raise
+    check_capture_cancelled(cancel_event)
     entries.sort(key=lambda entry: int(entry["leaf"]["node_id"]))
     return {"version": 2, "id": uuid4().hex, "apic_id": apic["id"], "apic": apic["address"],
             "phase": "post" if baseline else "pre", "baseline_id": baseline["id"] if baseline else None,
@@ -110,9 +128,25 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
             "ssh_connection": "nexus_dashboard" if jump else "direct", "nodes": entries}
 
 
+def baseline_role_commands(snapshot: dict) -> dict:
+    if "role_commands" in snapshot:
+        return snapshot["role_commands"]
+    replacements = {MAC_QUERY: LEGACY_MAC_COMMAND, ISIS_QUERY: LEGACY_ISIS_COMMAND}
+    commands = {role: [replacements.get(command, command) for command in values]
+                for role, values in ROLE_COMMANDS.items()}
+    for role in commands:
+        recorded = dict.fromkeys(command for entry in snapshot["nodes"]
+                                 if entry["leaf"].get("role", "leaf") == role
+                                 for command in entry.get("commands", {}))
+        if recorded:
+            commands[role] = list(recorded)
+    return commands
+
+
 def node_commands(snapshot: dict, entry: dict) -> tuple[str, ...]:
     role = entry["leaf"].get("role", "leaf")
-    return tuple(snapshot.get("role_commands", ROLE_COMMANDS)[role])
+    return tuple(snapshot["role_commands"][role] if "role_commands" in snapshot
+                 else entry.get("commands") or ROLE_COMMANDS[role])
 
 
 def snapshot_results(snapshot: dict, baseline: dict | None = None) -> list[dict]:
@@ -123,9 +157,11 @@ def snapshot_results(snapshot: dict, baseline: dict | None = None) -> list[dict]
     return [{"id": f"{entry['leaf']['node_id']}:{command}",
              "node_id": entry["leaf"]["node_id"], "name": entry["leaf"]["name"],
              "role": entry["leaf"].get("role", "leaf"),
-             "command": command, "state": "CAPTURED" if result.get("status") == "OK" and not entry["error"] else "ERROR",
+             "command": command, "command_label": command_label(command),
+             "state": "CAPTURED" if result.get("status") == "OK" and not entry["error"] else "ERROR",
              "pre": result.get("output", ""), "post": "",
-             "detail": entry["error"] or (result.get("output", "") if result.get("status") != "OK" else "")}
+             "detail": entry["error"] or (result.get("error") or result.get("output", "")
+                                        if result.get("status") != "OK" else "")}
             for entry in snapshot["nodes"] for command in node_commands(snapshot, entry)
             for result in [entry["commands"].get(command, {})]]
 
@@ -164,16 +200,49 @@ def _environment_signature(output: str) -> dict | None:
     return components
 
 
+def _module_signature(output: str) -> dict | None:
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if line.split() != ["Mod", "Ports", "Module-Type", "Model", "Status"]:
+            continue
+        modules = {}
+        for row in lines[index + 1:]:
+            if not row.strip(" -"):
+                if modules:
+                    break
+                continue
+            values = row.split()
+            if not values or not values[0].isdigit():
+                break
+            if len(values) < 5 or not values[1].isdigit():
+                return None
+            module_type = " ".join(values[2:-2])
+            status = values[-1]
+            if (module_type.lower() in {"supervisor module", "system controller"}
+                    and status.lower() in {"active", "standby"}):
+                status = "active/standby"
+            if values[0] in modules:
+                return None
+            modules[values[0]] = {
+                "ports": values[1], "type": module_type, "model": values[-2], "status": status,
+            }
+        return modules or None
+    return None
+
+
 def _isis_signature(output: str) -> dict | None:
     lines = output.splitlines()
+    adjacencies = {}
+    found_header = False
     for index, line in enumerate(lines):
         header = line.lower()
         if not all(field in header for field in ("system id", "snpa", "level", "state", "hold time", "interface")):
             continue
-        adjacencies = {}
+        found_header = True
+        parsed_rows = False
         for row in lines[index + 1:]:
             if not row.strip():
-                if adjacencies:
+                if parsed_rows:
                     break
                 continue
             if not row.strip(" -"):
@@ -182,12 +251,123 @@ def _isis_signature(output: str) -> dict | None:
             if (len(values) >= 6 and
                     values[-1].lower().startswith(("ethernet", "eth", "port-channel", "po"))):
                 system_id, state = values[0], values[3]
-                interface = values[-1]
-                adjacencies[f"neighbor {system_id} on {interface}"] = {"state": state}
-            elif adjacencies:
+                adjacencies.setdefault(f"neighbor {system_id}", []).append(state)
+                parsed_rows = True
+            elif parsed_rows:
                 break
-        return adjacencies
+    return {key: {"state": ", ".join(sorted(states))} for key, states in adjacencies.items()} if found_header else None
+
+
+def _port_channels(output: str) -> dict | None:
+    if not re.search(r"Group\s+Port-.*Member Ports", output):
+        return None
+    channels = {}
+    current = None
+    for line in output.splitlines():
+        match = re.match(r"\s*\d+\s+Po(\d+)\(([^)]+)\)\s+(\S+)\s+(\S+)\s*(.*)", line)
+        if match:
+            identifier, flags, kind, protocol, members = match.groups()
+            if identifier in channels:
+                return None
+            current = {"flags": flags, "type": kind, "protocol": protocol, "members": {}}
+            channels[identifier] = current
+        elif current is not None and re.match(r"\s*(?:Eth|Ethernet)\d", line, re.IGNORECASE):
+            members = line.strip()
+        else:
+            if re.match(r"\s*\d+\s+Po", line):
+                return None
+            current = None
+            continue
+        parsed = re.findall(r"(?:Eth|Ethernet)(\d+(?:/\d+)+)\(([^)]+)\)", members, re.IGNORECASE)
+        if re.sub(r"(?:Eth|Ethernet)\d+(?:/\d+)+\([^)]+\)", "", members, flags=re.IGNORECASE).strip():
+            return None
+        for port, flag in parsed:
+            physical = "Ethernet" + port
+            if physical in current["members"]:
+                return None
+            current["members"][physical] = flag
+    return channels
+
+
+def _port_channel_signature(output: str) -> dict | None:
+    channels = _port_channels(output)
+    if channels is None:
+        return None
+    signature = {}
+    for channel in channels.values():
+        if not channel["members"]:
+            return None
+        key = "members " + ", ".join(sorted(channel["members"]))
+        if key in signature:
+            return None
+        signature[key] = {field: channel[field] for field in ("flags", "type", "protocol")}
+        signature[key].update(channel["members"])
+    return signature
+
+
+def _vpc_signature(output: str, channel_output: dict) -> dict | None:
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "vPC status":
+            continue
+        header_index = next((offset for offset in range(index + 1, len(lines))
+                             if re.match(r"\s*id\s+Port\s+Status\s+Consistency\s+Reason\s+Active vlans",
+                                         lines[offset])), None)
+        if header_index is None:
+            return None
+        header = lines[header_index]
+        fields = ("Status", "Consistency", "Reason", "Active vlans")
+        starts = [header.index(field) for field in fields]
+        channels = (_port_channels(channel_output.get("output", ""))
+                    if channel_output.get("status") == "OK" else None)
+        signature = {"vPC context": {"output": " ".join("\n".join(lines[:index]).split())}}
+        current = None
+        for row in lines[header_index + 1:]:
+            if not row.strip() or not row.strip(" -"):
+                continue
+            match = re.match(r"\s*\d+\s+Po(\d+)\s+", row)
+            if match:
+                channel = channels.get(match[1]) if channels is not None else None
+                if not channel or not channel["members"]:
+                    raise ValueError("Cannot map vPC port-channels to physical members: "
+                                     "a usable show port-channel summary is required in both captures")
+                key = "members " + ", ".join(sorted(channel["members"]))
+                if key in signature:
+                    raise ValueError("Multiple vPCs map to the same physical members")
+                current = {field: [] for field in fields}
+                signature[key] = current
+            elif current is None or row[:starts[0]].strip():
+                return None
+            for field_index, field in enumerate(fields):
+                value = row[starts[field_index]:starts[field_index + 1] if field_index + 1 < len(fields) else None].strip()
+                if value:
+                    current[field].append(value)
+        for key, values in signature.items():
+            if key != "vPC context":
+                signature[key] = {field: ("".join(parts) if field == "Active vlans" else " ".join(parts))
+                                  for field, parts in values.items()}
+        return signature
     return None
+
+
+def _mac_query_signature(output: str) -> dict:
+    endpoints = {}
+    for attributes in moquery_attributes(output, "epmMacEp"):
+        if "tunnel" in attributes["ifId"].lower():
+            continue
+        key = f"MAC {attributes['addr'].lower()} | dn={attributes['dn']}"
+        endpoints.setdefault(key, {"count": 0})["count"] += 1
+    return endpoints
+
+
+def _isis_query_signature(output: str) -> dict:
+    neighbors = {}
+    for attributes in moquery_attributes(output, "isisAdjEp"):
+        neighbor = next(attributes[field].strip() for field in ("sysId", "name")
+                        if isinstance(attributes.get(field), str) and attributes[field].strip())
+        identifier = re.sub(r"[:.]", "", neighbor.lower())
+        neighbors.setdefault(f"neighbor {identifier}", []).append(attributes["operSt"].lower())
+    return {key: {"operSt": ", ".join(sorted(states))} for key, states in neighbors.items()}
 
 
 def _output_diff(before: str, after: str) -> str:
@@ -219,9 +399,9 @@ def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
             post = entry["commands"].get(command, {})
             state, detail = "MATCH", ""
             if entry["error"] or post.get("status") != "OK":
-                state, detail = "ERROR", entry["error"] or post.get("output", "No post output")
+                state, detail = "ERROR", entry["error"] or post.get("error") or post.get("output", "No post output")
             elif previous.get("error") or pre.get("status") != "OK":
-                state, detail = "NO_BASELINE", previous.get("error") or pre.get("output", "No pre output")
+                state, detail = "NO_BASELINE", previous.get("error") or pre.get("error") or pre.get("output", "No pre output")
             elif command == COMMAND:
                 pre_ports = {row["port"]: row for row in parse_interface_brief(pre["output"])}
                 post_ports = {row["port"]: row for row in parse_interface_brief(post["output"])}
@@ -236,12 +416,36 @@ def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
             else:
                 normalizer = {
                     "show environment": _environment_signature,
+                    "show module": _module_signature,
+                    "show port-channel summary": _port_channel_signature,
                     "show isis adjacency vrf all": _isis_signature,
+                    MAC_QUERY: _mac_query_signature,
+                    ISIS_QUERY: _isis_query_signature,
                 }.get(command)
                 before_text, after_text = pre["output"], post["output"]
-                before_signature = normalizer(before_text) if normalizer else None
-                after_signature = normalizer(after_text) if normalizer else None
-                if before_signature is not None and after_signature is not None:
+                mapping_error = ""
+                before_signature = after_signature = None
+                try:
+                    before_signature = normalizer(before_text) if normalizer else None
+                except ValueError as error:
+                    state, mapping_error = "NO_BASELINE", f"Invalid PRE output: {error}"
+                if not mapping_error:
+                    try:
+                        after_signature = normalizer(after_text) if normalizer else None
+                    except ValueError as error:
+                        state, mapping_error = "ERROR", f"Invalid POST output: {error}"
+                if command == "show vpc":
+                    try:
+                        before_signature = _vpc_signature(
+                            before_text, previous.get("commands", {}).get("show port-channel summary", {}))
+                        after_signature = _vpc_signature(
+                            after_text, entry["commands"].get("show port-channel summary", {}))
+                    except ValueError as error:
+                        state = "ERROR"
+                        mapping_error = str(error)
+                if mapping_error:
+                    detail = mapping_error
+                elif before_signature is not None and after_signature is not None:
                     if before_signature != after_signature:
                         state = "REVIEW"
                         detail = _signature_diff(before_signature, after_signature)
@@ -251,6 +455,7 @@ def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
             rows.append({"id": f"{node_id}:{command}", "node_id": node_id,
                          "role": entry["leaf"].get("role", "leaf"),
                          "name": entry["leaf"]["name"], "command": command,
+                         "command_label": command_label(command),
                          "state": state, "detail": detail, "pre": pre.get("output", ""),
                          "post": post.get("output", "")})
     return rows
@@ -318,7 +523,8 @@ def filter_results(rows: list[dict], result: str = "attention", node_id: str | N
         if search.strip().casefold() not in " ".join(str(row[key]) for key in ("node_id", "name", "command", "state")).casefold() + " " + context.casefold():
             continue
         filtered.append({key: row[key] for key in ("id", "node_id", "name", "command", "state")}
-                | {"context": context, "role": row.get("role", "leaf")})
+                | {"context": context, "role": row.get("role", "leaf"),
+                   "command_label": command_label(row["command"])})
     return filtered
 
 

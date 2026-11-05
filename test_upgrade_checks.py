@@ -1,9 +1,12 @@
 import ast
+import asyncio
 import importlib.util
 import inspect
 import hashlib
+import json
 import os
 import sqlite3
+import threading
 import subprocess
 import sys
 import tempfile
@@ -77,6 +80,255 @@ class JumpConnectionTests(unittest.TestCase):
             profile_credential_values(existing, "other-user", "")
 
 
+class AccountUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_reset_ui_validates_clears_secrets_and_revokes_target_sessions(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+
+        async def click(button):
+            handler = next(listener.handler for listener in button._event_listeners.values()
+                           if listener.type == "click")
+            await inspect.getclosurevars(handler).nonlocals["callback"]()
+
+        async def io_bound(function, *args):
+            if function.__name__ == "reset_password":
+                self.assertEqual(new.value, "")
+                self.assertEqual(confirmation.value, "")
+                self.assertFalse(button.enabled)
+            return function(*args)
+
+        with tempfile.TemporaryDirectory() as directory, Client(ui.page("/_account_reset_test")) as client:
+            store = ProfileStore(Path(directory) / "data", Path(directory) / "vault.key")
+            store.add_user("admin", "admin-web-password")
+            store.create_user("admin", "engineer", "engineer-password")
+            admin_storage = {"username": "admin", "auth_version": store.user("admin")["auth_version"],
+                             "authenticated_at": web.time.time()}
+            storage = dict(admin_storage)
+            with patch.object(web, "STORE", store, create=True), \
+                    patch.object(web, "app", SimpleNamespace(storage=SimpleNamespace(user=storage))), \
+                    patch.object(web.run, "io_bound", side_effect=io_bound), \
+                    patch.object(web, "notify_error") as error, \
+                    patch.object(ui, "notify") as notify, \
+                    patch.object(ui.navigate, "to") as navigate:
+                with ui.column() as container:
+                    web.users_dialog()
+                elements = list(client.elements.values())
+                target = next(item for item in elements if item._props.get("label") == "User account")
+                new = next(item for item in elements if item._props.get("label") == "New password")
+                confirmation = next(item for item in elements if item._props.get("label") == "Confirm new password")
+                button = next(item for item in elements if item._props.get("label") == "Reset password")
+                self.assertEqual(target.options, ["engineer"])
+                next(item for item in elements if item._props.get("label") == "New username").value = "new-user"
+                for label in ("Initial password", "Confirm initial password"):
+                    next(item for item in elements if item._props.get("label") == label).value = "new-user-password"
+                await click(next(item for item in elements if item._props.get("label") == "Create user"))
+                self.assertEqual(target.options, ["engineer", "new-user"])
+                notify.reset_mock()
+                await click(button)
+                self.assertIn("Select a user", str(error.call_args.args[0]))
+                target.value = "engineer"
+                new.value, confirmation.value = "replacement-password", "mismatch"
+                await click(button)
+                self.assertIn("do not match", str(error.call_args.args[0]))
+                self.assertTrue(button.enabled)
+                self.assertTrue(store.authenticate("engineer", "engineer-password"))
+                storage["auth_version"] = -1
+                new.value = confirmation.value = "replacement-password"
+                await click(button)
+                self.assertIn("Session expired", str(error.call_args.args[0]))
+                self.assertTrue(store.authenticate("engineer", "engineer-password"))
+                storage.update(admin_storage)
+                error.reset_mock()
+                new.value = confirmation.value = "replacement-password"
+                await click(button)
+                error.assert_not_called()
+                notify.assert_called_once()
+                self.assertTrue(store.authenticate("engineer", "replacement-password"))
+                self.assertEqual(storage, admin_storage)
+                self.assertTrue(button.enabled)
+                storage.update(username="engineer", auth_version=0)
+                with self.assertRaisesRegex(ValueError, "Session expired"):
+                    web.owner()
+                navigate.assert_called_with("/login")
+                container.delete()
+
+
+class ACIReportUITests(unittest.TestCase):
+    def test_long_individual_report_scrolls_and_query_labels_are_display_only(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        commands = ["show vpc", common.MAC_QUERY, common.ISIS_QUERY]
+        snapshot = {"id": "long-pre", "phase": "pre", "captured_at": "2026-11-05", "group": "all",
+                    "apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": commands, "spine": [common.ISIS_QUERY]},
+                    "nodes": [{"leaf": {"node_id": "101", "name": "leaf101"}, "error": "",
+                               "commands": {command: {"status": "OK", "output": "long output\n" * 6000}
+                                            for command in commands}}]}
+        with Client(ui.page("/_aci_long_report_test")) as client, \
+                patch.object(web, "owner", return_value="admin"), \
+                patch.object(web, "STORE", create=True) as store, \
+                patch.object(web, "load_snapshots", return_value=[snapshot]), \
+                patch.object(web, "dashboard_picker", side_effect=lambda label: ui.select({}, label=label)):
+            store.apics.return_value = [{"id": "fabric", "address": "192.0.2.1"}]
+            store.user.return_value = {"role": "operator"}
+            web.aci_panel(ui.select({"fabric": "Fabric"}, value="fabric"))
+            history = next(item for item in client.elements.values() if item._props.get("label") == "Snapshot")
+            history.value = snapshot["id"]
+            table = next(item for item in client.elements.values() if isinstance(item, ui.table) and item.row_key == "id")
+            query_row = next(row for row in table.rows if row["command"] == common.MAC_QUERY)
+            self.assertEqual(query_row["command_label"], common.MAC_QUERY + " (show mac add dyn)")
+            self.assertEqual(next(column for column in table.columns if column["name"] == "command")["field"],
+                             "command_label")
+            picker = next(item for item in client.elements.values() if item._props.get("label") == "Command")
+            self.assertEqual(picker.options[common.MAC_QUERY], query_row["command_label"])
+            table.selected = [next(row for row in table.rows if row["command"] == "show vpc")]
+            button = next(item for item in client.elements.values() if item._props.get("label") == "Inspect result")
+            handler = next(listener.handler for listener in button._event_listeners.values() if listener.type == "click")
+            inspect.getclosurevars(handler).nonlocals["callback"]()
+            card = next(item for item in client.elements.values() if isinstance(item, ui.card) and "report-dialog" in item._classes)
+            self.assertIsNotNone(card)
+            rule = web.CSS.split(".report-dialog {", 1)[1].split("}", 1)[0]
+            self.assertIn("max-height:92vh", rule)
+            self.assertIn("overflow-y:auto", rule)
+            expected = ("long output\n" * 6000)[:60000].strip()
+            self.assertTrue(any(item.content == expected for item in client.elements.values()
+                                if isinstance(item, ui.code)))
+
+    def test_aggregate_dialog_includes_all_switches_and_keeps_pre_post_and_differences(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        rows = [{"command": "show module", "node_id": str(node), "name": f"switch{node}",
+                 "role": "leaf", "state": state, "pre": f"pre-{node}", "post": f"post-{node}",
+                 "detail": f"diff-{node}" if state != "MATCH" else ""}
+                for node, state in ((201, "REVIEW"), (101, "MATCH"), (202, "ERROR"))]
+        rows.append({**rows[0], "command": "show vpc", "pre": "not-this-command"})
+        with Client(ui.page("/_aci_aggregate_test")) as client, \
+                patch.object(web, "owner", return_value="admin"):
+            web.aci_command_outputs_dialog(rows, "show module", "post")
+            elements = list(client.elements.values())
+            headings = [item.text for item in elements if isinstance(item, ui.label)]
+            self.assertIn("show module | All 3 switches", headings)
+            node_headings = [text for text in headings if text.startswith("Node")]
+            self.assertTrue(node_headings[0].startswith("Node 101"))
+            contents = [item.content for item in elements if isinstance(item, ui.code)]
+            for node in (101, 201, 202):
+                self.assertIn(f"pre-{node}", contents)
+                self.assertIn(f"post-{node}", contents)
+            self.assertIn("diff-201", contents)
+            self.assertIn("diff-202", contents)
+            self.assertIn("No differences", contents)
+            self.assertNotIn("not-this-command", contents)
+            panels = next(item for item in elements if isinstance(item, ui.tab_panels))
+            self.assertEqual(panels.value, "Difference")
+        with Client(ui.page("/_aci_aggregate_pre_test")) as client, \
+                patch.object(web, "owner", return_value="admin"):
+            web.aci_command_outputs_dialog([{**rows[0], "pre": "x" * 60001, "post": "", "detail": "",
+                                             "state": "CAPTURED"}], "show module", "pre")
+            elements = list(client.elements.values())
+            panels = next(item for item in elements if isinstance(item, ui.tab_panels))
+            self.assertEqual(panels.value, "Pre")
+            contents = [item.content for item in elements if isinstance(item, ui.code)]
+            self.assertIn("x" * 60000, contents)
+            self.assertIn("No output", contents)
+        with Client(ui.page("/_aci_aggregate_empty_test")), \
+                patch.object(web, "owner", return_value="admin"), patch.object(ui, "notify") as notify:
+            web.aci_command_outputs_dialog([], "show module", "pre")
+            notify.assert_called_once()
+
+    def test_report_command_links_open_aggregate_without_replacing_individual_inspection(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        snapshot = {"id": "pre-example", "phase": "pre", "captured_at": "2026-11-05", "group": "all",
+                    "apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": ["show module"], "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": str(node), "name": f"switch{node}"}, "error": "",
+                               "commands": {"show module": {"status": "OK", "output": f"output-{node}"}}}
+                              for node in (101, 102)]}
+        with Client(ui.page("/_aci_report_links_test")) as client, \
+                patch.object(web, "owner", return_value="admin"), \
+                patch.object(web, "STORE", create=True) as store, \
+                patch.object(web, "load_snapshots", return_value=[snapshot]), \
+                patch.object(web, "dashboard_picker", side_effect=lambda label: ui.select({}, label=label)), \
+                patch.object(web, "aci_command_outputs_dialog") as aggregate:
+            store.apics.return_value = [{"id": "fabric", "address": "192.0.2.1"}]
+            store.user.return_value = {"role": "operator"}
+            apic = ui.select({"fabric": "Fabric"}, value="fabric")
+            web.aci_panel(apic)
+            history = next(item for item in client.elements.values() if item._props.get("label") == "Snapshot")
+            history.value = snapshot["id"]
+            next(item for item in client.elements.values() if item._props.get("label") == "Result").value = "attention"
+            buttons = [item for item in client.elements.values() if isinstance(item, ui.button)]
+            self.assertTrue(any(item._props.get("label") == "Inspect result" for item in buttons))
+            button = next(item for item in buttons if item._props.get("label") == "show module")
+            handler = next(listener.handler for listener in button._event_listeners.values() if listener.type == "click")
+            inspect.getclosurevars(handler).nonlocals["callback"]()
+            aggregate.assert_called_once()
+            outputs, command, phase = aggregate.call_args.args
+            self.assertEqual(len(outputs), 2)
+            self.assertEqual((command, phase), ("show module", "pre"))
+            apic.value = None
+            self.assertFalse(any(item._props.get("label") == "show module"
+                                 for item in client.elements.values() if isinstance(item, ui.button)))
+
+
+class ACICancelUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_button_stops_capture_without_saving_and_restores_controls(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        started = threading.Event()
+        def cancelled_capture(*args, **kwargs):
+            started.set()
+            if not kwargs["cancel_event"].wait(5):
+                raise AssertionError("Cancel button did not signal capture")
+            common.check_capture_cancelled(kwargs["cancel_event"])
+
+        async def io_bound(function, *args):
+            return await asyncio.to_thread(function, *args)
+
+        def callback(button):
+            handler = next(listener.handler for listener in button._event_listeners.values() if listener.type == "click")
+            return inspect.getclosurevars(handler).nonlocals["callback"]
+
+        with Client(ui.page("/_aci_cancel_test")) as client, \
+                patch.object(web, "owner", return_value="admin"), \
+                patch.object(web, "STORE", create=True) as store, \
+                patch.object(web, "load_snapshots", return_value=[]), \
+                patch.object(web, "dashboard_picker", side_effect=lambda label: ui.select({}, label=label)), \
+                patch.object(web, "saved_credentials", return_value={"username": "user", "password": "synthetic", "domain": "local"}), \
+                patch.object(web.run, "io_bound", side_effect=io_bound), \
+                patch.object(web, "capture_snapshot", side_effect=cancelled_capture), \
+                patch.object(web, "save_snapshot") as save, \
+                patch.object(web, "notify_error") as error, \
+                patch.object(ui, "notify") as notify:
+            store.apics.return_value = [{"id": "fabric", "address": "192.0.2.1", "verify_tls": True}]
+            store.user.return_value = {"role": "operator"}
+            store.dns_domain.return_value = ""
+            apic = ui.select({"fabric": "Fabric"}, value="fabric")
+            web.aci_panel(apic)
+            start = next(item for item in client.elements.values() if item._props.get("label") == "Run ACI checks")
+            cancel = next(item for item in client.elements.values() if item._props.get("label") == "Cancel ACI checks")
+            self.assertFalse(cancel.enabled)
+            running = asyncio.create_task(callback(start)())
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            self.assertFalse(start.enabled)
+            self.assertFalse(apic.enabled)
+            self.assertTrue(cancel.enabled)
+            callback(cancel)()
+            self.assertFalse(cancel.enabled)
+            await asyncio.wait_for(running, 6)
+            save.assert_not_called()
+            error.assert_not_called()
+            notify.assert_called_once_with("ACI capture cancelled; no snapshot saved", type="warning")
+            self.assertTrue(start.enabled)
+            self.assertTrue(apic.enabled)
+            self.assertFalse(cancel.enabled)
+
+
 class NavigationTests(unittest.TestCase):
     def test_alphabetical_tabs_and_grouped_upgrade_workflows(self):
         import automation_ui
@@ -96,16 +348,18 @@ class InterfaceDescriptionTests(unittest.TestCase):
     def test_description_editor_uses_stable_component_not_dynamic_slots(self):
         import automation_ui
         from nicegui import ui
+        from nicegui.client import Client
         from interface_description_table import InterfaceDescriptionTable
         tree = ast.parse(inspect.getsource(automation_ui.interface_description_panel))
         assignment = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
                           and any(isinstance(target, ast.Name) and target.id == "interfaces" for target in node.targets))
         self.assertEqual(assignment.value.func.value.func.id, "InterfaceDescriptionTable")
-        with ui.column() as container:
-            table = InterfaceDescriptionTable(rows=[], row_key="interface", selection="multiple", pagination=15)
-        self.assertEqual(table.selection, "multiple")
-        self.assertNotIn("body-cell-proposed", table.slots)
-        container.delete()
+        with Client(ui.page("/_description_component_test")):
+            with ui.column() as container:
+                table = InterfaceDescriptionTable(rows=[], row_key="interface", selection="multiple", pagination=15)
+            self.assertEqual(table.selection, "multiple")
+            self.assertNotIn("body-cell-proposed", table.slots)
+            container.delete()
 
     def test_unconfigured_ports_remain_visible_but_are_not_editable(self):
         import copy
@@ -1467,9 +1721,10 @@ class SnapshotTests(unittest.TestCase):
             {"id": "201", "name": "spine201", "role": "spine"},
         ], [{"id": "101", "oobMgmtAddr": "192.0.2.101"}]]
 
-        def output(*args, commands):
+        def output(*args, commands, **kwargs):
             return {command: {"status": "OK", "output": "eth1/1 0 eth trunk up none 10G --"
-                              if command == common.COMMAND else "stable"} for command in commands}
+                              if command == common.COMMAND else '{"totalCount":"0","imdata":[]}'
+                              if command in (common.MAC_QUERY, common.ISIS_QUERY) else "stable"} for command in commands}
 
         capture.side_effect = output
         profile = {"id": "fabric", "address": "192.0.2.1", "verify_tls": True, "dns_suffix": "obsolete.test"}
@@ -1508,6 +1763,8 @@ class SnapshotTests(unittest.TestCase):
                                         [{"id": "101", "oobMgmtAddr": "192.0.2.101"}]]
         capture.return_value = {command: {"status": "OK", "output": "stable"}
                                 for command in common.DIAGNOSTIC_COMMANDS}
+        for command in (common.MAC_QUERY, common.ISIS_QUERY):
+            capture.return_value[command]["output"] = '{"totalCount":"0","imdata":[]}'
         capture.return_value[common.COMMAND]["output"] = "eth1/1 0 eth trunk up none 10G --"
         profile = {"id": "fabric", "address": "192.0.2.10", "verify_tls": True}
         pre = capture_snapshot(profile, "netops", "synthetic")
@@ -1741,6 +1998,72 @@ class CaptureTests(unittest.TestCase):
         rows = {row["command"]: row for row in compare_snapshots(pre, post)}
         self.assertEqual(rows["show environment"]["state"], "REVIEW")
 
+    def test_module_comparison_ignores_role_swaps_and_all_later_tables(self):
+        import copy
+        output = (
+            "Mod  Ports  Module-Type                         Model              Status\n"
+            "---  -----  ----------------------------------- ------------------ ----------\n"
+            "1    36     36p 40/100G Ethernet Module          N9K-X9736C-FX       ok\n"
+            "22   0      Fabric Module C8                    N9K-C9508-FM-E2    ok\n"
+            "27   0      Supervisor Module                   N9K-SUP-B+         active\n"
+            "28   0      Supervisor Module                   N9K-SUP-B+         standby\n"
+            "29   0      System Controller                   N9K-SC-A           standby\n"
+            "30   0      System Controller                   N9K-SC-A           active\n"
+            "\n\nMod  Sw              Hw\n"
+            "---  --------------  ------\n"
+            "1    16.0(6c)        1.1\n"
+            "22   16.0(6c)        1.1\n"
+            "27   16.0(6c)        1.0\n"
+            "\nMod  MAC-Address(es)                         Serial-Num\n"
+            "---  --------------------------------------  ----------\n"
+            "1    00-11-22-33-44-55 to 00-11-22-33-44-66   old-serial\n"
+        )
+        pre = {"apic_id": "fabric", "apic": "192.0.2.1", "nodes": [{
+            "leaf": {"node_id": "201", "name": "spine201", "role": "spine"}, "error": "",
+            "commands": {"show module": {"status": "OK", "output": output}},
+        }], "role_commands": {"leaf": ["show module"], "spine": ["show module"]}}
+        post = copy.deepcopy(pre)
+        changed = (output.replace("active", "temporary").replace("standby", "active")
+                   .replace("temporary", "standby").replace("16.0(6c)", "16.1(6g)")
+                   .replace("1.0", "2.0").replace("old-serial", "new-serial"))
+        post["nodes"][0]["commands"]["show module"]["output"] = changed
+        row = compare_snapshots(pre, post)[0]
+        self.assertEqual(row["state"], "MATCH")
+        self.assertEqual(row["detail"], "")
+        self.assertEqual(row["pre"], output)
+        self.assertEqual(row["post"], changed)
+        post["nodes"][0]["commands"]["show module"]["output"] = changed.split("\n\n")[0]
+        self.assertEqual(compare_snapshots(pre, post)[0]["state"], "MATCH")
+        for old, new in (
+                ("N9K-X9736C-FX", "N9K-X9736C-EX"),
+                ("36p 40/100G Ethernet Module", "36p 40/100G Other Module"),
+                ("1    36", "1    32"),
+                ("N9K-SUP-B+", "N9K-SUP-A+"),
+                ("N9K-SC-A", "N9K-SC-B"),
+                ("ok\n", "failed\n"),
+                ("standby\n", "failed\n"),
+                ("active\n", "powered-dn\n"),
+                ("22   0      Fabric Module C8                    N9K-C9508-FM-E2    ok\n", "")):
+            with self.subTest(old=old, new=new):
+                post["nodes"][0]["commands"]["show module"]["output"] = changed.replace(old, new)
+                row = compare_snapshots(pre, post)[0]
+                self.assertEqual(row["state"], "REVIEW")
+                self.assertNotIn("16.0(6c)", row["detail"])
+                self.assertNotIn("old-serial", row["detail"])
+        pre["nodes"][0]["commands"]["show module"]["output"] = output.replace(
+            "N9K-X9736C-FX       ok", "N9K-X9736C-FX       active")
+        post["nodes"][0]["commands"]["show module"]["output"] = changed.replace(
+            "N9K-X9736C-FX       ok", "N9K-X9736C-FX       standby")
+        self.assertEqual(compare_snapshots(pre, post)[0]["state"], "REVIEW")
+        pre["nodes"][0]["commands"]["show module"]["output"] = output
+        post["nodes"][0]["commands"]["show module"]["output"] = "unrecognized output"
+        self.assertEqual(compare_snapshots(pre, post)[0]["state"], "REVIEW")
+        post["nodes"][0]["commands"]["show module"]["status"] = "ERROR"
+        self.assertEqual(compare_snapshots(pre, post)[0]["state"], "ERROR")
+        post["nodes"][0]["commands"]["show module"] = pre["nodes"][0]["commands"]["show module"].copy()
+        pre["nodes"][0]["commands"]["show module"]["status"] = "ERROR"
+        self.assertEqual(compare_snapshots(pre, post)[0]["state"], "NO_BASELINE")
+
     def test_isis_comparison_ignores_hold_time_but_checks_adjacency_identity_and_state(self):
         import copy
         pre_output = (
@@ -1771,7 +2094,10 @@ class CaptureTests(unittest.TestCase):
         post_output = pre_output.replace("Ethernet1/31.35", "Ethernet1/31.36")
         post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = post_output
         rows = {row["command"]: row for row in compare_snapshots(pre, post)}
-        self.assertEqual(rows["show isis adjacency vrf all"]["state"], "REVIEW")
+        self.assertEqual(rows["show isis adjacency vrf all"]["state"], "MATCH")
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = pre_output.replace(
+            "Ethernet1/31.35", "Ethernet1/54.433").replace("4270.4064.0000", "4280.4064.0000")
+        self.assertEqual(compare_snapshots(pre, post)[-1]["state"], "REVIEW")
 
     @patch("aci_checks.capture_leaf_commands")
     def test_post_auth_rejection_stops_unproven_credentials(self, capture):
@@ -1786,7 +2112,292 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(all(entry["error"] for entry in snapshot["nodes"]))
 
 
+class ACICommandComparisonTests(unittest.TestCase):
+    def compare_outputs(self, before, after):
+        def snapshot(outputs):
+            return {"apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": list(outputs), "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": "101", "name": "leaf101"}, "error": "",
+                               "commands": {command: {"status": "OK", "output": output}
+                                            for command, output in outputs.items()}}]}
+        return {row["command"]: row for row in compare_snapshots(snapshot(before), snapshot(after))}
+
+    def test_one_ru_module_ignores_version_hardware_and_serial_changes(self):
+        output = (
+            "Mod  Ports  Module-Type                         Model              Status\n"
+            "---  -----  ----------------------------------- ------------------ ----------\n"
+            "1    36     30x40G/100G+6x40G/100G Switch       N9K-C9336C-FX2     ok\n\n\n"
+            "Mod  Sw              Hw\n"
+            "---  --------------  ------\n"
+            "1    16.0(6c)        1.0\n\n\n"
+            "Mod  MAC-Address(es)                         Serial-Num\n"
+            "---  --------------------------------------  ----------\n"
+            "1    bc-26-c7-d0-92-85 to bc-26-c7-d0-93-1a  FDO222905PA\n"
+        )
+        changed = output.replace("16.0(6c)", "16.1(6g)").replace("1.0", "2.0").replace("FDO222905PA", "new-serial")
+        row = self.compare_outputs({"show module": output}, {"show module": changed})["show module"]
+        self.assertEqual(row["state"], "MATCH")
+        self.assertEqual(row["post"], changed)
+        for old, new in (("ok\n", "failed\n"), ("N9K-C9336C-FX2", "N9K-C9336C-FX3"), ("1    36", "1    32")):
+            with self.subTest(old=old):
+                row = self.compare_outputs({"show module": output}, {"show module": changed.replace(old, new)})["show module"]
+                self.assertEqual(row["state"], "REVIEW")
+
+    def test_isis_preserves_duplicate_neighbor_counts_and_states_across_tables(self):
+        header = "System ID         SNPA            Level  State  Hold Time  Interface\n"
+        output = (header +
+                  "418C.4364.0000     N/A             1      UP     00:00:57   Ethernet1/53.7\n"
+                  "418C.4364.0000     N/A             1      UP     00:00:52   Ethernet1/54.8\n\n" +
+                  "IS-IS process: other VRF:other\n" + header +
+                  "428C.4364.0000     N/A             1      UP     00:00:52   Ethernet1/54.8\n")
+        changed = output.replace("Ethernet1/54.8", "Ethernet1/54.433").replace("00:00:52", "00:00:01")
+        command = "show isis adjacency vrf all"
+        self.assertEqual(self.compare_outputs({command: output}, {command: changed})[command]["state"], "MATCH")
+        for changed in (output.replace("UP     00:00:52", "DOWN   00:00:52"),
+                        output.replace("418C.4364.0000     N/A             1      UP     00:00:52   Ethernet1/54.8\n", "")):
+            self.assertEqual(self.compare_outputs({command: output}, {command: changed})[command]["state"], "REVIEW")
+
+    @staticmethod
+    def query_output(class_name, attributes):
+        return json.dumps({"totalCount": str(len(attributes)), "imdata": [
+            {class_name: {"attributes": values}} for values in attributes]})
+
+    def test_mac_json_compares_addr_and_dn_and_ignores_tunnels_and_other_fields(self):
+        first = {"addr": "00:50:56:51:4A:62", "dn": "sys/ctx-[vxlan-1]/bd-[vxlan-2]/mac-00:50:56:51:4A:62",
+                 "ifId": "eth1/23", "flags": "local,mac", "createTs": "old"}
+        second = {**first, "addr": "00:50:56:56:04:C2", "dn": "sys/mac-second"}
+        before = self.query_output("epmMacEp", [first, second, {"ifId": "tunnel234"}])
+        after = self.query_output("epmMacEp", [{**second, "ifId": "eth1/99"},
+                                               {**first, "createTs": "new", "pcTag": "42"}])
+        command = common.MAC_QUERY
+        row = self.compare_outputs({command: before}, {command: after})[command]
+        self.assertEqual(row["state"], "MATCH")
+        self.assertEqual(row["command"], command)
+        self.assertEqual(row["command_label"], f"{command} (show mac add dyn)")
+        for attributes in ([second], [first, second, second],
+                           [{**first, "addr": "00:50:56:51:4A:63"}, second],
+                           [{**first, "dn": "changed-dn"}, second],
+                           [{**first, "ifId": "Tunnel99"}, second]):
+            with self.subTest(attributes=attributes):
+                changed = self.query_output("epmMacEp", attributes)
+                row = self.compare_outputs({command: before}, {command: changed})[command]
+                self.assertEqual(row["state"], "REVIEW")
+        empty = self.query_output("epmMacEp", [])
+        row = self.compare_outputs({command: empty}, {command: self.query_output("epmMacEp", [{"ifId": "tunnel1"}])})[command]
+        self.assertEqual(row["state"], "MATCH")
+
+    def test_isis_json_compares_neighbor_and_operst_only(self):
+        first = {"name": "4170.4064.0000", "sysId": "41:70:40:64:00:00", "operSt": "up",
+                 "dn": "sys/isis/if-[eth1/36.7]/adj", "holdExpTs": "old", "peerCktId": "35"}
+        second = {**first, "name": "4070.4064.0000", "sysId": "40:70:40:64:00:00"}
+        before = self.query_output("isisAdjEp", [first, second])
+        after = self.query_output("isisAdjEp", [{**second, "dn": "sys/isis/if-[eth1/35.433]/adj"},
+                                                {**first, "holdExpTs": "new", "peerCktId": "99", "name": "renamed"}])
+        command = common.ISIS_QUERY
+        self.assertEqual(self.compare_outputs({command: before}, {command: after})[command]["state"], "MATCH")
+        fallback = self.query_output("isisAdjEp", [{"name": first["name"], "operSt": "UP"},
+                                                  {"name": second["name"], "operSt": "up"}])
+        self.assertEqual(self.compare_outputs({command: before}, {command: fallback})[command]["state"], "MATCH")
+        for attributes in ([first], [first, second, second], [{**first, "operSt": "down"}, second],
+                           [{**first, "sysId": "42:70:40:64:00:00"}, second]):
+            row = self.compare_outputs({command: before}, {command: self.query_output("isisAdjEp", attributes)})[command]
+            self.assertEqual(row["state"], "REVIEW")
+
+    def test_invalid_or_incomplete_json_never_matches(self):
+        for command, class_name, record in (
+                (common.MAC_QUERY, "epmMacEp", {"addr": "mac", "dn": "sys/mac", "ifId": "eth1/1"}),
+                (common.ISIS_QUERY, "isisAdjEp", {"sysId": "41:70:40:64:00:00", "operSt": "up"})):
+            valid = self.query_output(class_name, [record])
+            for invalid in ("{truncated", "[]", '{"imdata":[]}', '{"totalCount":"128","imdata":[]}',
+                            '{"totalCount":"1","imdata":[{}]}', self.query_output(class_name, [{}])):
+                with self.subTest(command=command, invalid=invalid):
+                    self.assertEqual(self.compare_outputs({command: valid}, {command: invalid})[command]["state"], "ERROR")
+                    self.assertEqual(self.compare_outputs({command: invalid}, {command: valid})[command]["state"], "NO_BASELINE")
+
+    CHANNELS = (
+        "Flags: D - Down P - Up in port-channel\n"
+        "-------------------------------------------------------------------------------\n"
+        "Group Port-       Type     Protocol  Member Ports\n"
+        "      Channel\n"
+        "-------------------------------------------------------------------------------\n"
+        "4     Po4(SD)     Eth      LACP      Eth1/26(D)\n"
+        "2     Po2(SU)     Eth      LACP      Eth1/24(P) Eth1/25(P)\n"
+        "10    Po10(SD)    Eth      LACP      Eth1/32(D)\n"
+    )
+    VPC = (
+        "Legend:\n"
+        "        (*) - local vPC is down, forwarding via vPC peer-link\n\n"
+        "vPC domain id                     : 113\n"
+        "Peer status                       : peer adjacency formed ok\n"
+        "Configuration consistency status  : success\n"
+        "vPC role                          : secondary\n\n"
+        "vPC Peer-link status\n"
+        "---------------------------------------------------------------------\n"
+        "id   Port   Status Active vlans\n"
+        "--   ----   ------ --------------------------------------------------\n"
+        "1           up     -\n\n"
+        "vPC status\n"
+        "----------------------------------------------------------------------\n"
+        "id   Port   Status Consistency Reason                     Active vlans\n"
+        "--   ----   ------ ----------- ------                     ------------\n"
+        "345  Po4    down*  success     success\n\n"
+        "346  Po2    up     success     success                    32,200-201,\n"
+        "                                                          226,294,424\n\n"
+        "349  Po10   down*  Not         Consistency Check Not\n"
+        "                   Applicable  Performed\n"
+    )
+
+    def test_port_channel_renumbering_and_row_and_member_order_do_not_change_results(self):
+        command = "show port-channel summary"
+        changed = (
+            self.CHANNELS[:self.CHANNELS.index("4     Po4")] +
+            "9     Po9(SD)     Eth      LACP      Ethernet1/32(D)\n"
+            "8     Po8(SU)     Eth      LACP      Ethernet1/25(P)\n"
+            "                                    Eth1/24(P)\n"
+            "1     Po1(SD)     Eth      LACP      Eth1/26(D)\n"
+        )
+        row = self.compare_outputs({command: self.CHANNELS}, {command: changed})[command]
+        self.assertEqual(row["state"], "MATCH")
+        for old, new in (("Eth1/26(D)", "Eth1/26(P)"),
+                         ("Po1(SD)", "Po1(SU)"),
+                         ("LACP", "NONE"),
+                         ("Eth1/24(P)", "Eth1/23(P)"),
+                         ("Ethernet1/25(P)", "")):
+            with self.subTest(old=old):
+                row = self.compare_outputs({command: self.CHANNELS}, {command: changed.replace(old, new)})[command]
+                self.assertEqual(row["state"], "REVIEW")
+
+    def test_vpc_uses_each_snapshots_physical_members_and_preserves_health_checks(self):
+        before = {"show port-channel summary": self.CHANNELS, "show vpc": self.VPC}
+        after = {"show port-channel summary": self.CHANNELS.replace("Po4(", "Po8(").replace("Po2(", "Po9(").replace("Po10(", "Po5("),
+                 "show vpc": self.VPC.replace("345  Po4", "888  Po8").replace("346  Po2", "999  Po9").replace("349  Po10", "777  Po5 ")}
+        rows = self.compare_outputs(before, after)
+        self.assertEqual(rows["show port-channel summary"]["state"], "MATCH")
+        self.assertEqual(rows["show vpc"]["state"], "MATCH")
+        for old, new, expected in (
+                ("down*  success", "down*  failed ", "Consistency"),
+                ("success                    32", "failure                    32", "Reason"),
+                ("Applicable  Performed", "Applicable  Failed", "Reason"),
+                ("Consistency Check Not", "Consistency Check Bad", "Reason"),
+                ("down*  success", "up     success", "Status"),
+                ("226,294,424", "226,294,425", "Active vlans"),
+                ("peer adjacency formed ok", "peer adjacency failed", "vPC context")):
+            with self.subTest(old=old):
+                row = self.compare_outputs(before, {**after, "show vpc": after["show vpc"].replace(old, new)})["show vpc"]
+                self.assertEqual(row["state"], "REVIEW")
+                self.assertIn(expected, row["detail"])
+                if expected != "vPC context":
+                    self.assertIn("members Ethernet", row["detail"])
+        swapped = after["show vpc"].replace("Po8", "temporary").replace("Po5", "Po8").replace("temporary", "Po5")
+        self.assertEqual(self.compare_outputs(before, {**after, "show vpc": swapped})["show vpc"]["state"], "REVIEW")
+        missing = {"show vpc": after["show vpc"]}
+        row = self.compare_outputs(before, missing)["show vpc"]
+        self.assertEqual(row["state"], "ERROR")
+        self.assertIn("show port-channel summary", row["detail"])
+        row = self.compare_outputs(before, {**after, "show port-channel summary": "unrecognized"})["show vpc"]
+        self.assertEqual(row["state"], "ERROR")
+        duplicate = after["show vpc"].replace("777  Po5 ", "777  Po8 ")
+        row = self.compare_outputs(before, {**after, "show vpc": duplicate})["show vpc"]
+        self.assertEqual(row["state"], "ERROR")
+        row = self.compare_outputs(before, {**after, "show vpc": after["show vpc"].replace("Po8", "Po88")})["show vpc"]
+        self.assertEqual(row["state"], "ERROR")
+
+
+class ACIQueryCaptureTests(unittest.TestCase):
+    def test_exact_moqueries_are_allowed_but_other_shell_commands_are_rejected(self):
+        for command in (common.MAC_QUERY, common.ISIS_QUERY):
+            common.assert_read_only(command)
+            for suffix in ("\n", "; reload", " | bash", " > output", " && reboot"):
+                with self.subTest(command=command, suffix=suffix), self.assertRaises(RuntimeError):
+                    common.assert_read_only(command + suffix)
+        for command in ("moquery -c other -o json", "moquery -c isisAdjEp -o xml",
+                        common.MAC_QUERY.replace("local", "remote")):
+            with self.assertRaises(RuntimeError):
+                common.assert_read_only(command)
+        with self.assertRaises(ValueError):
+            common.validate_role_commands({"leaf": [common.ISIS_QUERY], "spine": [common.MAC_QUERY]})
+
+    @patch.object(common, "ConnectHandler")
+    def test_json_capture_retains_raw_errors_and_successful_empty_output(self, connect):
+        invalid = '{"totalCount":"128","imdata":[]}'
+        empty = '{"totalCount":"0","imdata":[]}'
+        connect.return_value.send_command.side_effect = [invalid, empty]
+        results = common.capture_leaf_commands("switch", "user", "synthetic",
+                                               commands=(common.MAC_QUERY, common.ISIS_QUERY))
+        self.assertEqual(results[common.MAC_QUERY]["status"], "ERROR")
+        self.assertEqual(results[common.MAC_QUERY]["output"], invalid)
+        self.assertIn("Incomplete", results[common.MAC_QUERY]["error"])
+        self.assertEqual(results[common.ISIS_QUERY]["status"], "OK")
+        connect.return_value.disconnect.assert_called_once()
+
+    @patch.object(common, "ConnectHandler")
+    def test_cancel_during_command_disconnects_and_stops_remaining_commands(self, connect):
+        event = threading.Event()
+        def output(*args, **kwargs):
+            event.set()
+            return "output"
+        connect.return_value.send_command.side_effect = output
+        with self.assertRaises(common.CaptureCancelled):
+            common.capture_leaf_commands("switch", "user", "synthetic",
+                                        commands=("show version", "show module"), cancel_event=event)
+        self.assertEqual(connect.return_value.send_command.call_count, 1)
+        connect.return_value.disconnect.assert_called_once()
+        connect.reset_mock()
+        with self.assertRaises(common.CaptureCancelled):
+            common.capture_leaf_commands("switch", "user", "synthetic", cancel_event=event)
+        connect.assert_not_called()
+
+    @patch("aci_checks.capture_leaf_commands")
+    @patch("aci_checks.ApicClient")
+    def test_cancel_stops_queued_switches_and_returns_no_snapshot(self, client, capture):
+        event = threading.Event()
+        baseline = {"id": "pre", "apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": ["show module"], "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": str(node), "name": f"leaf{node}", "oob_ip": "192.0.2.2"},
+                               "commands": {}} for node in range(101, 110)]}
+        def output(*args, **kwargs):
+            self.assertIs(kwargs["cancel_event"], event)
+            event.set()
+            return {"show module": {"status": "OK", "output": "output"}}
+        capture.side_effect = output
+        with self.assertRaises(common.CaptureCancelled):
+            capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic",
+                             baseline=baseline, workers=1, cancel_event=event)
+        capture.assert_called_once()
+        client.assert_not_called()
+        capture.reset_mock()
+        with self.assertRaises(common.CaptureCancelled):
+            capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic", cancel_event=event)
+        capture.assert_not_called()
+        client.assert_not_called()
+
+    @patch("aci_checks.capture_leaf_commands")
+    def test_legacy_baseline_commands_remain_unchanged_for_post(self, capture):
+        baseline = {"id": "pre", "apic_id": "fabric", "apic": "192.0.2.1",
+                    "nodes": [{"leaf": {"node_id": "101", "name": "leaf101", "oob_ip": "192.0.2.2"},
+                               "error": "", "commands": {
+                                   command: {"status": "OK", "output": "stable"}
+                                   for command in (common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND)}}]}
+        capture.return_value = baseline["nodes"][0]["commands"]
+        post = capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic", baseline=baseline)
+        self.assertEqual(capture.call_args.kwargs["commands"],
+                         (common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND))
+        self.assertTrue(all(row["state"] == "MATCH" for row in compare_snapshots(baseline, post)))
+
+
 class ProfileTests(unittest.TestCase):
+    def test_saved_legacy_command_lists_upgrade_without_changing_other_custom_commands(self):
+        apic = self.store.save_apic("Migration", "192.0.2.1")
+        legacy = {"leaf": [common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND, "show version"],
+                  "spine": [common.LEGACY_ISIS_COMMAND]}
+        self.store.save_aci_commands(apic, legacy)
+        commands = self.store.aci_commands(apic)
+        self.assertEqual(commands["leaf"], (common.MAC_QUERY, common.ISIS_QUERY, "show version"))
+        self.assertEqual(commands["spine"], (common.ISIS_QUERY,))
+        self.store.save_aci_commands(apic, commands)
+        reopened = ProfileStore(self.root / "data", self.root / "keys" / "vault.key")
+        self.assertEqual(reopened.aci_commands(apic), commands)
+
     def test_login_domain_is_inherited_and_can_be_overridden_per_server(self):
         first = self.store.save_apic("First", "192.0.2.1")
         second = self.store.save_apic("Second", "192.0.2.2")
@@ -2054,6 +2665,43 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(self.store.authenticate("operator", "new-password-123"))
         self.assertEqual(self.store.user("operator")["auth_version"], previous + 1)
         self.assertEqual(self.store.credentials("operator", "aci:test")["password"], "device-secret")
+
+    def test_admin_password_reset_preserves_account_and_credentials_and_revokes_sessions(self):
+        self.store.create_user("operator", "engineer", "engineer-password")
+        self.store.save_credentials("engineer", "aci:test", {"password": "device-secret"})
+        self.store.set_theme("engineer", "dark")
+        account = self.store.user("engineer")
+        for actor, target, new, confirmation, message in (
+                ("engineer", "operator", "replacement-password", "replacement-password", "Administrator"),
+                ("missing", "engineer", "replacement-password", "replacement-password", "Administrator"),
+                ("operator", "missing", "replacement-password", "replacement-password", "does not exist"),
+                ("operator", "operator", "replacement-password", "replacement-password", "Change password"),
+                ("operator", "engineer", "short", "short", "at least 12"),
+                ("operator", "engineer", "replacement-password", "mismatch", "do not match"),
+                ("operator", "engineer", "engineer-password", "engineer-password", "different password")):
+            with self.subTest(actor=actor, target=target, new=new), self.assertRaisesRegex(ValueError, message):
+                self.store.reset_password(actor, target, new, confirmation)
+        self.assertEqual(self.store.user("engineer"), account)
+        version = self.store.reset_password("operator", "engineer", "replacement-password", "replacement-password")
+        self.assertEqual(version, account["auth_version"] + 1)
+        self.assertFalse(self.store.authenticate("engineer", "engineer-password"))
+        self.assertTrue(self.store.authenticate("engineer", "replacement-password"))
+        self.assertEqual(self.store.user("engineer"), {**account, "auth_version": version})
+        self.assertEqual(self.store.credentials("engineer", "aci:test")["password"], "device-secret")
+        reopened = ProfileStore(self.root / "data", self.root / "keys" / "vault.key")
+        self.assertTrue(reopened.authenticate("engineer", "replacement-password"))
+        self.assertEqual(reopened.user("engineer")["auth_version"], version)
+        self.store.create_user("operator", "other-admin", "admin-web-password", "admin")
+        self.store.reset_password("operator", "other-admin", "replacement-password", "replacement-password")
+        self.assertEqual(self.store.user("other-admin")["role"], "admin")
+
+    def test_admin_password_reset_rejects_corporate_oidc_accounts(self):
+        account = self.store.login_oidc("https://issuer.example/tenant", "subject-reset",
+                                       "corporate", "Corporate User", "operator")
+        with self.assertRaisesRegex(ValueError, "identity provider"):
+            self.store.reset_password("operator", account["username"], "replacement-password", "replacement-password")
+        self.assertEqual(self.store.user(account["username"])["auth_version"], account["auth_version"])
+        self.assertFalse(self.store.authenticate(account["username"], "replacement-password"))
 
     def test_theme_persists_for_each_account(self):
         self.store.create_user("operator", "engineer", "engineer-password")

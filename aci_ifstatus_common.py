@@ -2,7 +2,7 @@
 Shared helpers for aci_leaf_ifstatus_pre.py and aci_leaf_ifstatus_post.py.
 
 READ-ONLY BY DESIGN. APIC is only queried with GET class queries (plus the
-aaaLogin/aaaLogout session calls). Leaves only receive `show` commands.
+aaaLogin/aaaLogout session calls). Leaves only receive guarded read-only commands.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import os
 import re
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,24 +28,28 @@ from netmiko.exceptions import NetmikoAuthenticationException
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 COMMAND = "show interface brief"
+MAC_QUERY = """moquery -c epmMacEp -f 'epm.MacEp.flags*"local"' -o json"""
+ISIS_QUERY = "moquery -c isisAdjEp -o json"
+LEGACY_MAC_COMMAND = "show mac address-table dynamic | egrep -v tun"
+LEGACY_ISIS_COMMAND = "show isis adjacency vrf all"
 DIAGNOSTIC_COMMANDS = (
     COMMAND,
     "show environment",
     "show vpc",
     "show port-channel summary",
-    "show mac address-table dynamic | egrep -v tun",
+    MAC_QUERY,
     "show endpoint summary",
     "show module",
     "show lldp neighbor",
-    "show isis adjacency vrf all",
+    ISIS_QUERY,
 )
 SHARED_DIAGNOSTIC_COMMANDS = (
     COMMAND, "show environment", "show module", "show lldp neighbor",
-    "show isis adjacency vrf all",
+    ISIS_QUERY,
 )
 LEAF_ONLY_COMMANDS = (
     "show vpc", "show port-channel summary", "show endpoint summary",
-    "show mac address-table dynamic | egrep -v tun",
+    MAC_QUERY,
 )
 ROLE_COMMANDS = {"leaf": DIAGNOSTIC_COMMANDS, "spine": SHARED_DIAGNOSTIC_COMMANDS}
 
@@ -69,8 +74,8 @@ _CMD_CHAINERS = ("\n", "\r", ";", "&&", "||", "|", "`", "$(")
 
 
 def assert_read_only(command: str) -> None:
-    """Raise RuntimeError if `command` is not a pure `show` command."""
-    if command == "show mac address-table dynamic | egrep -v tun":
+    """Allow show commands and the two exact read-only JSON queries."""
+    if command in (LEGACY_MAC_COMMAND, MAC_QUERY, ISIS_QUERY):
         return
     if not _READ_ONLY_CMD.match(command):
         raise RuntimeError(f"REFUSED: non-read-only command blocked: {command!r}")
@@ -96,7 +101,8 @@ def validate_role_commands(commands: dict | None = None) -> dict[str, tuple[str,
                 raise ValueError("Commands must be strings")
             assert_read_only(command)
             command = " ".join(command.split())
-            leaf_prefixes = [leaf_only.split(" | ")[0] for leaf_only in LEAF_ONLY_COMMANDS]
+            leaf_prefixes = [leaf_only.split(" | ")[0].lower()
+                             for leaf_only in (*LEAF_ONLY_COMMANDS, LEGACY_MAC_COMMAND)]
             if role == "spine" and any(command.lower() == prefix or command.lower().startswith(prefix + " ")
                                        for prefix in leaf_prefixes):
                 raise ValueError(f"{command} is leaf-only")
@@ -104,6 +110,57 @@ def validate_role_commands(commands: dict | None = None) -> dict[str, tuple[str,
                 unique.append(command)
         validated[role] = tuple(unique)
     return validated
+
+
+def upgraded_role_commands(commands: dict | None) -> dict[str, tuple[str, ...]]:
+    validated = validate_role_commands(commands)
+    replacements = {LEGACY_MAC_COMMAND: MAC_QUERY, LEGACY_ISIS_COMMAND: ISIS_QUERY}
+    return validate_role_commands({role: [replacements.get(command, command) for command in values]
+                                   for role, values in validated.items()})
+
+
+def command_label(command: str) -> str:
+    return {MAC_QUERY: f"{MAC_QUERY} (show mac add dyn)",
+            ISIS_QUERY: f"{ISIS_QUERY} (show isis adjacency vrf all)"}.get(command, command)
+
+
+class CaptureCancelled(Exception):
+    """A cancelled capture must not be saved as a completed snapshot."""
+
+
+def check_capture_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise CaptureCancelled("ACI capture cancelled")
+
+
+def moquery_attributes(output: str, class_name: str) -> list[dict]:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid {class_name} JSON output: {error.msg}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("imdata"), list):
+        raise ValueError(f"Invalid {class_name} JSON: imdata must be a list")
+    count = payload.get("totalCount")
+    if not isinstance(count, (str, int)) or isinstance(count, bool) or not str(count).isdigit():
+        raise ValueError(f"Invalid {class_name} JSON: totalCount is required")
+    if int(count) != len(payload["imdata"]):
+        raise ValueError(f"Incomplete {class_name} output: totalCount does not match imdata")
+    attributes = []
+    for record in payload["imdata"]:
+        item = record.get(class_name) if isinstance(record, dict) else None
+        values = item.get("attributes") if isinstance(item, dict) else None
+        if not isinstance(values, dict):
+            raise ValueError(f"Invalid {class_name} record: attributes are required")
+        if class_name == "epmMacEp":
+            required = ("ifId",) if "tunnel" in str(values.get("ifId", "")).lower() else ("addr", "dn", "ifId")
+        else:
+            required = ("operSt",)
+            if not any(isinstance(values.get(field), str) and values[field].strip() for field in ("sysId", "name")):
+                raise ValueError("Invalid isisAdjEp record: neighbor sysId or name is required")
+        if any(not isinstance(values.get(field), str) or not values[field].strip() for field in required):
+            raise ValueError(f"Invalid {class_name} record: {', '.join(required)} are required")
+        attributes.append(values)
+    return attributes
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +324,12 @@ def fqdn(host: str, dns_domain: str = "") -> str:
 def capture_leaf_commands(target: str, username: str, password: str,
                           connect_timeout: int = 20, read_timeout: int = 90,
                           commands: tuple[str, ...] = DIAGNOSTIC_COMMANDS,
-                          jump: dict | None = None) -> dict[str, dict]:
-    """Capture guarded show commands through one SSH session, retaining failures."""
+                          jump: dict | None = None,
+                          cancel_event: threading.Event | None = None) -> dict[str, dict]:
+    """Capture guarded read-only commands through one SSH session, retaining failures."""
     for command in commands:
         assert_read_only(command)
+    check_capture_cancelled(cancel_event)
     results = {}
     if jump:
         from aci_jump import NexusDashboardSSH
@@ -283,8 +342,10 @@ def capture_leaf_commands(target: str, username: str, password: str,
         )
     try:
         for command in commands:
+            check_capture_cancelled(cancel_event)
             try:
                 output = conn.send_command(command, read_timeout=read_timeout, cmd_verify=False)
+                check_capture_cancelled(cancel_event)
                 error = bool(re.search(
                     r"(?im)^\s*(?:%.*(?:invalid|error|incomplete|ambiguous)|"
                     r"(?:error:|invalid command|syntax error))", output,
@@ -293,6 +354,13 @@ def capture_leaf_commands(target: str, username: str, password: str,
                     error = True
                 results[command] = {"status": "ERROR" if error or not output.strip() else "OK",
                                     "output": output}
+                if command in (MAC_QUERY, ISIS_QUERY):
+                    try:
+                        moquery_attributes(output, "epmMacEp" if command == MAC_QUERY else "isisAdjEp")
+                    except ValueError as exc:
+                        results[command].update(status="ERROR", error=str(exc))
+            except CaptureCancelled:
+                raise
             except Exception as exc:
                 results[command] = {"status": "ERROR", "output": f"{type(exc).__name__}: {exc}"}
     finally:

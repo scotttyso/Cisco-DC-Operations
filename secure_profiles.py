@@ -206,6 +206,27 @@ class ProfileStore:
                 raise ValueError("Password changed in another session; sign in again")
             return database.execute("SELECT auth_version FROM users WHERE username = ?", (username,)).fetchone()["auth_version"]
 
+    def reset_password(self, actor: str, username: str, new: str, confirmation: str) -> int:
+        with self.connection() as database:
+            self.require_admin(database, actor)
+            if username == actor:
+                raise ValueError("Use Change password to change your own password")
+            row = database.execute("SELECT password FROM users WHERE username = ?", (username,)).fetchone()
+            if not row:
+                raise ValueError("That user account does not exist")
+            if database.execute("SELECT 1 FROM oidc_identities WHERE username = ?", (username,)).fetchone():
+                raise ValueError("Corporate passwords must be changed through the identity provider")
+            if new != confirmation:
+                raise ValueError("New passwords do not match")
+            if password_matches(new, row["password"]):
+                raise ValueError("Choose a different password")
+            encoded = password_hash(new)
+            updated = database.execute("""UPDATE users SET password = ?, auth_version = auth_version + 1
+                WHERE username = ? AND password = ?""", (encoded, username, row["password"]))
+            if not updated.rowcount:
+                raise ValueError("Password changed in another session; try again")
+            return database.execute("SELECT auth_version FROM users WHERE username = ?", (username,)).fetchone()["auth_version"]
+
     def set_theme(self, username: str, theme: str) -> None:
         if theme not in ("light", "dark"):
             raise ValueError("Unknown theme")
@@ -377,10 +398,10 @@ class ProfileStore:
             database.execute("DELETE FROM credentials WHERE scope = ?", ("nd-profile:" + profile_id,))
 
     def aci_commands(self, profile_id: str) -> dict[str, tuple[str, ...]]:
-        from aci_ifstatus_common import validate_role_commands
+        from aci_ifstatus_common import upgraded_role_commands
         with self.connection() as database:
             row = database.execute("SELECT commands FROM aci_command_lists WHERE apic_id = ?", (profile_id,)).fetchone()
-        return validate_role_commands(json.loads(row["commands"]) if row else None)
+        return upgraded_role_commands(json.loads(row["commands"]) if row else None)
 
     def save_aci_commands(self, profile_id: str, commands: dict) -> None:
         from aci_ifstatus_common import validate_role_commands
