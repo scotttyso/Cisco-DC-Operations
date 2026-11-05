@@ -1880,6 +1880,63 @@ class SummaryTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_discovery_collects_inband_and_preserves_legacy_cli_manifest_shape(self):
+        client = MagicMock()
+        nodes = [{"id": str(node), "name": f"leaf{node}", "role": "leaf"}
+                 for node in range(101, 106)]
+        systems = [
+            {"id": "101", "inbMgmtAddr": " 192.0.2.101 ", "oobMgmtAddr": "192.0.2.201"},
+            {"id": "102", "inbMgmtAddr": "0.0.0.0", "oobMgmtAddr": "192.0.2.202"},
+            {"id": "103", "inbMgmtAddr": "::"},
+            {"id": "104", "inbMgmtAddr": "2001:db8::104"},
+        ]
+        client.get_class.side_effect = [nodes, systems, nodes, systems]
+        discovered = common.discover_active_nodes(client)
+        self.assertEqual([node["inb_ip"] for node in discovered],
+                         ["192.0.2.101", "", "", "2001:db8::104", ""])
+        self.assertEqual(discovered[0]["oob_ip"], "192.0.2.201")
+        legacy = common.discover_active_leaves(client)
+        self.assertTrue(all("inb_ip" not in node and "role" not in node for node in legacy))
+        self.assertTrue(all(set(node).issubset(common.MANIFEST_FIELDS) for node in legacy))
+
+    @patch("aci_checks.capture_leaf_commands")
+    @patch("aci_checks.ApicClient")
+    def test_pre_and_post_use_inband_oob_then_hostname_for_direct_and_jump(self, client_type, capture):
+        nodes = [{"id": str(node), "name": f"leaf{node}", "role": "leaf"}
+                 for node in range(101, 105)]
+        systems = [
+            {"id": "101", "inbMgmtAddr": "192.0.2.101", "oobMgmtAddr": "192.0.2.201"},
+            {"id": "102", "inbMgmtAddr": "0.0.0.0", "oobMgmtAddr": "192.0.2.202"},
+            {"id": "103", "inbMgmtAddr": "::", "oobMgmtAddr": "0.0.0.0"},
+            {"id": "104", "inbMgmtAddr": "2001:db8::104"},
+        ]
+        capture.return_value = {"show module": {"status": "OK", "output": "stable"}}
+        profile = {"id": "fabric", "address": "192.0.2.1", "verify_tls": True}
+        commands = {"leaf": ["show module"], "spine": ["show module"]}
+        expected = ["192.0.2.101", "192.0.2.202", "leaf103.example.test", "2001:db8::104"]
+        for jump in (None, {"host": "nd.example.test", "password": "synthetic"}):
+            with self.subTest(jump=bool(jump)):
+                client_type.return_value.get_class.side_effect = [nodes, systems]
+                pre = capture_snapshot(profile, "user", "synthetic", workers=1,
+                                       dns_domain="example.test", role_commands=commands, jump=jump)
+                self.assertEqual([entry["target"] for entry in pre["nodes"]], expected)
+                self.assertEqual([call.args[0] for call in capture.call_args_list], expected)
+                self.assertEqual(pre["nodes"][0]["leaf"]["inb_ip"], "192.0.2.101")
+                capture.reset_mock()
+                client_type.reset_mock()
+                post = capture_snapshot(profile, "user", "synthetic", baseline=pre, workers=1,
+                                        dns_domain="example.test", jump=jump)
+                self.assertEqual([entry["target"] for entry in post["nodes"]], expected)
+                self.assertEqual([call.args[0] for call in capture.call_args_list], expected)
+                client_type.assert_not_called()
+                capture.reset_mock()
+        for entry in pre["nodes"]:
+            entry["leaf"].pop("inb_ip")
+        legacy_post = capture_snapshot(profile, "user", "synthetic", baseline=pre, workers=1,
+                                       dns_domain="example.test")
+        self.assertEqual([entry["target"] for entry in legacy_post["nodes"]],
+                         ["192.0.2.201", "192.0.2.202", "leaf103.example.test", "leaf104.example.test"])
+
     def test_discovery_includes_leaf_and_spine_roles(self):
         from unittest.mock import MagicMock
         client = MagicMock()
@@ -2218,6 +2275,26 @@ class ACICommandComparisonTests(unittest.TestCase):
                     self.assertEqual(self.compare_outputs({command: valid}, {command: invalid})[command]["state"], "ERROR")
                     self.assertEqual(self.compare_outputs({command: invalid}, {command: valid})[command]["state"], "NO_BASELINE")
 
+    def test_no_mos_found_is_an_empty_mac_table_not_a_json_error(self):
+        command = common.MAC_QUERY
+        empty = self.query_output("epmMacEp", [])
+        populated = self.query_output("epmMacEp", [{"addr": "00:50:56:51:4A:62",
+                                                   "dn": "sys/mac-example", "ifId": "eth1/23"}])
+        for before, after, state in (
+                ("No Mos found", "No Mos found", "MATCH"),
+                (" \nNo Mos found\r\n", empty, "MATCH"),
+                (empty, "No Mos found", "MATCH"),
+                ("No Mos found", populated, "REVIEW"),
+                (populated, "No Mos found", "REVIEW")):
+            with self.subTest(before=before, after=after):
+                row = self.compare_outputs({command: before}, {command: after})[command]
+                self.assertEqual(row["state"], state)
+                self.assertEqual(row["pre"], before)
+                self.assertEqual(row["post"], after)
+        for invalid in ("No Mos found\nERROR: query failed", "No Mos found unexpectedly"):
+            with self.assertRaises(ValueError):
+                common.moquery_attributes(invalid, "epmMacEp")
+
     CHANNELS = (
         "Flags: D - Down P - Up in port-channel\n"
         "-------------------------------------------------------------------------------\n"
@@ -2308,6 +2385,14 @@ class ACICommandComparisonTests(unittest.TestCase):
 
 
 class ACIQueryCaptureTests(unittest.TestCase):
+    @patch.object(common, "ConnectHandler")
+    def test_capture_no_mos_found_mac_table_is_successful_and_keeps_raw_output(self, connect):
+        output = "\nNo Mos found\n"
+        connect.return_value.send_command.return_value = output
+        results = common.capture_leaf_commands("switch", "user", "synthetic", commands=(common.MAC_QUERY,))
+        self.assertEqual(results[common.MAC_QUERY], {"status": "OK", "output": output})
+        connect.return_value.disconnect.assert_called_once()
+
     def test_exact_moqueries_are_allowed_but_other_shell_commands_are_rejected(self):
         for command in (common.MAC_QUERY, common.ISIS_QUERY):
             common.assert_read_only(command)

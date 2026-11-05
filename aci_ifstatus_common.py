@@ -134,6 +134,8 @@ def check_capture_cancelled(cancel_event: threading.Event | None) -> None:
 
 
 def moquery_attributes(output: str, class_name: str) -> list[dict]:
+    if class_name == "epmMacEp" and output.strip() == "No Mos found":
+        return []
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as error:
@@ -231,7 +233,7 @@ class ApicClient:
 
 
 def discover_active_nodes(client: ApicClient, roles: tuple[str, ...] = ("leaf", "spine")) -> list[dict]:
-    """Return active fabric switches with role and OOB management address."""
+    """Return active fabric switches with role and management addresses."""
     if not roles or any(role not in ROLE_COMMANDS for role in roles):
         raise ValueError("Supported fabric roles are leaf and spine")
     fabric_roles = ",".join(f'eq(fabricNode.role,"{role}")' for role in roles)
@@ -247,11 +249,14 @@ def discover_active_nodes(client: ApicClient, roles: tuple[str, ...] = ("leaf", 
         role = n.get("role", "leaf" if roles == ("leaf",) else "")
         if role not in roles:
             continue
-        oob = (systems.get(n.get("id"), {}).get("oobMgmtAddr") or "").strip()
+        system = systems.get(n.get("id"), {})
+        inband = (system.get("inbMgmtAddr") or "").strip()
+        oob = (system.get("oobMgmtAddr") or "").strip()
         pod = re.search(r"/pod-(\d+)/", n.get("dn", ""))
         leaves.append({
             "node_id": n.get("id", ""),
             "name": n.get("name", ""),
+            "inb_ip": "" if inband in ("", "0.0.0.0", "::") else inband,
             "oob_ip": "" if oob in ("", "0.0.0.0") else oob,
             "pod": pod.group(1) if pod else "",
             "model": n.get("model", ""),
@@ -264,7 +269,7 @@ def discover_active_nodes(client: ApicClient, roles: tuple[str, ...] = ("leaf", 
 
 def discover_active_leaves(client: ApicClient) -> list[dict]:
     """Keep the original CLI manifest leaf-only and CSV-compatible."""
-    return [{key: value for key, value in node.items() if key != "role"}
+    return [{key: value for key, value in node.items() if key not in ("role", "inb_ip")}
             for node in discover_active_nodes(client, roles=("leaf",))]
 
 

@@ -104,7 +104,7 @@ accounts are trusted automation operators, not read-only viewers.
 
 The **DNS Domain** is one shared setting for all APICs/fabrics and all WebUI users,
 not a per-APIC field or hard-coded Python value. It is used only
-when a switch has no OOB address and its name is not already fully qualified.
+when a switch has neither an in-band nor an OOB address and its name is not already fully qualified.
 Leave it blank to use the server's DNS search domains. A single unique domain in
 older per-APIC settings migrates automatically. Conflicting old values produce a
 warning on **APICs** instead of choosing one; save the correct shared DNS Domain.
@@ -186,8 +186,14 @@ Unsupported commands are retained as errors for review;
 ACI release/platform syntax has not been verified against live hardware here.
 
 1. Select **PRE baseline**, **Leaf and spine**, and **All node IDs**, then run the checks before upgrading.
-  Discovery queries active switches through APIC. SSH uses OOB IPs, falling
-  back to the switch name and the shared DNS Domain saved on the APICs tab.
+  Discovery queries active switches through APIC and collects `topSystem.inbMgmtAddr`
+  and `topSystem.oobMgmtAddr`. SSH selects the in-band IP first, then OOB IP when
+  no in-band address is configured, then the switch name and shared DNS Domain.
+  This priority applies to direct SSH and ND jump connections. It selects the
+  first configured address; connection failures do not trigger retries on other
+  addresses. POST reuses the addresses saved in PRE; older PRE snapshots without
+  an in-band address keep their OOB/hostname fallback. Capture a new PRE to use
+  newly collected in-band addresses. The legacy interface-only CLI is unchanged.
 2. Resolve all capture errors before the upgrade. Each PRE run creates a new
    immutable JSON snapshot; previous baselines are not overwritten.
 3. Select **POST comparison**, the appropriate PRE snapshot, and odd/even/all or
@@ -215,6 +221,8 @@ numbers, are ignored in the comparison. Full raw output remains available.
 This applies to both fixed 1-RU switches and modular chassis.
 The MAC `moquery` compares `addr` and `dn`, ignoring records whose `ifId` contains
 `tunnel` (case-insensitive). Other attributes and record ordering are ignored.
+The MAC query response `No Mos found` is a successful empty table: it matches
+another empty table, while changes to or from a populated table require review.
 Its command label includes **(show mac add dyn)** for recognition.
 The IS-IS `moquery` compares neighbor `sysId` (or `name` if unavailable) and
 `operSt`, including duplicate-neighbor counts. Timestamps, interface/DN changes,

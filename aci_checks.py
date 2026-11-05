@@ -73,7 +73,7 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
         auth_ok.set()
 
     def collect(leaf):
-        target = leaf["oob_ip"] or fqdn(leaf["name"], dns_domain)
+        target = leaf.get("inb_ip") or leaf.get("oob_ip") or fqdn(leaf["name"], dns_domain)
         entry = {"leaf": leaf, "target": target, "commands": {}, "error": ""}
 
         def capture():
