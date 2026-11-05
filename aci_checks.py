@@ -268,11 +268,34 @@ def _isis_signature(output: str) -> dict | None:
             if (len(values) >= 6 and
                     values[-1].lower().startswith(("ethernet", "eth", "port-channel", "po"))):
                 system_id, state = values[0], values[3]
-                adjacencies.setdefault(f"neighbor {system_id}", []).append(state)
+                interface = values[-1].split(".", 1)[0]
+                adjacencies.setdefault(f"neighbor {system_id} on {interface}", []).append(state)
                 parsed_rows = True
             elif parsed_rows:
                 break
     return {key: {"state": ", ".join(sorted(states))} for key, states in adjacencies.items()} if found_header else None
+
+
+def _mac_table_signature(output: str) -> dict | None:
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if "MAC Address" not in line or "Ports/SWID.SSID.LID" not in line:
+            continue
+        endpoints = {}
+        for row in lines[index + 1:]:
+            if not row.strip() or not row.strip(" -+"):
+                continue
+            if row.strip().endswith(("#", ">")) or row.strip().startswith("Total"):
+                break
+            values = row.split()
+            mac_index = next((offset for offset, value in enumerate(values)
+                              if re.fullmatch(r"[0-9a-fA-F]{4}(?:\.[0-9a-fA-F]{4}){2}", value)), None)
+            if mac_index is None or len(values[mac_index + 1:]) != 5:
+                raise ValueError(f"Cannot parse MAC table row: {row.strip()}")
+            mac, port = values[mac_index].lower(), values[-1].lower()
+            endpoints[f"MAC {mac} on {port}"] = {"port": port}
+        return endpoints
+    return None
 
 
 def _port_channels(output: str) -> dict | None:
@@ -436,6 +459,7 @@ def compare_snapshots(baseline: dict, current: dict) -> list[dict]:
                     "show module": _module_signature,
                     "show port-channel summary": _port_channel_signature,
                     "show isis adjacency vrf all": _isis_signature,
+                    LEGACY_MAC_COMMAND: _mac_table_signature,
                     MAC_QUERY: _mac_query_signature,
                     ISIS_QUERY: _isis_query_signature,
                 }.get(command)

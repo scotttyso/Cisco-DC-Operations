@@ -1811,7 +1811,8 @@ class SnapshotTests(unittest.TestCase):
         capture.return_value = {command: {"status": "OK", "output": "stable"}
                                 for command in common.DIAGNOSTIC_COMMANDS}
         for command in (common.MAC_QUERY, common.ISIS_QUERY):
-            capture.return_value[command]["output"] = '{"totalCount":"0","imdata":[]}'
+            if command in capture.return_value:
+                capture.return_value[command]["output"] = '{"totalCount":"0","imdata":[]}'
         capture.return_value[common.COMMAND]["output"] = "eth1/1 0 eth trunk up none 10G --"
         profile = {"id": "fabric", "address": "192.0.2.10", "verify_tls": True}
         pre = capture_snapshot(profile, "netops", "synthetic")
@@ -2200,6 +2201,11 @@ class CaptureTests(unittest.TestCase):
         rows = {row["command"]: row for row in compare_snapshots(pre, post)}
         self.assertEqual(rows["show isis adjacency vrf all"]["state"], "MATCH")
         post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = pre_output.replace(
+            "Ethernet1/31.35", "Ethernet1/54.433")
+        changed_interface = {row["command"]: row for row in compare_snapshots(pre, post)}["show isis adjacency vrf all"]
+        self.assertEqual(changed_interface["state"], "REVIEW")
+        self.assertIn("Ethernet1/54", changed_interface["detail"])
+        post["nodes"][0]["commands"]["show isis adjacency vrf all"]["output"] = pre_output.replace(
             "Ethernet1/31.35", "Ethernet1/54.433").replace("4270.4064.0000", "4280.4064.0000")
         self.assertEqual(compare_snapshots(pre, post)[-1]["state"], "REVIEW")
 
@@ -2260,6 +2266,42 @@ class ACICommandComparisonTests(unittest.TestCase):
         for changed in (output.replace("UP     00:00:52", "DOWN   00:00:52"),
                         output.replace("418C.4364.0000     N/A             1      UP     00:00:52   Ethernet1/54.8\n", "")):
             self.assertEqual(self.compare_outputs({command: output}, {command: changed})[command]["state"], "REVIEW")
+
+    def test_mac_show_compares_unique_mac_port_pairs_only(self):
+        header = (
+            "Legend:\n"
+            "        * - primary entry, G - Gateway MAC\n"
+            "   VLAN     MAC Address      Type      age     Secure NTFY Ports/SWID.SSID.LID\n"
+            "---------+-----------------+--------+---------+------+----+------------------\n"
+        )
+        rows = [
+            "* 110      6026.aa8e.bff8    dynamic      -       F    F    eth1/25\n",
+            "* 110      6026.aa8e.d5a0    dynamic      -       F    F    eth1/24\n",
+            "* 8        6026.aa8e.bff8    dynamic      -       F    F    eth1/25\n",
+            "* 8        6026.aa8e.d5a0    dynamic      -       F    F    eth1/24\n",
+        ]
+        before = header + "".join(rows) + "dcwgpflsw002#\n"
+        after = header + rows[1].replace("110", "999").replace("*", "+").replace("dynamic", "static") \
+            .replace(" - ", " 45 ").replace("F", "T") + rows[0].replace("110", "123").replace("bff8", "BFF8")
+        command = common.LEGACY_MAC_COMMAND
+        row = self.compare_outputs({command: before}, {command: after})[command]
+        self.assertEqual(row["state"], "MATCH")
+        self.assertEqual(row["pre"], before)
+        self.assertEqual(row["post"], after)
+        for changed in (
+                after.replace("eth1/25", "eth1/26"),
+                after.replace("eth1/24", "po7"),
+                after.replace("6026.aa8e.d5a0", "6026.aa8e.d5a1"),
+                header + rows[0],
+                after + "* 9 6026.aa8e.bff8 dynamic - F F eth1/27\n"):
+            with self.subTest(changed=changed):
+                row = self.compare_outputs({command: before}, {command: changed})[command]
+                self.assertEqual(row["state"], "REVIEW")
+                self.assertIn("MAC ", row["detail"])
+        self.assertEqual(self.compare_outputs({command: header}, {command: header})[command]["state"], "MATCH")
+        self.assertEqual(self.compare_outputs({command: before}, {command: header})[command]["state"], "REVIEW")
+        malformed = header + "* 110 6026.aa8e.bff8 dynamic\n"
+        self.assertEqual(self.compare_outputs({command: before}, {command: malformed})[command]["state"], "ERROR")
 
     @staticmethod
     def query_output(class_name, attributes):
@@ -2428,6 +2470,23 @@ class ACICommandComparisonTests(unittest.TestCase):
 
 
 class ACIQueryCaptureTests(unittest.TestCase):
+    @patch("aci_checks.capture_leaf_commands")
+    @patch("aci_checks.ApicClient")
+    def test_new_pre_restores_show_defaults_but_post_keeps_query_baselines(self, client, capture):
+        client.return_value.get_class.side_effect = [
+            [{"id": "101", "name": "leaf101", "role": "leaf"}],
+            [{"id": "101", "inbMgmtAddr": "192.0.2.101"}],
+        ]
+        capture.return_value = {"show module": {"status": "OK", "output": "stable"}}
+        profile = {"id": "fabric", "address": "192.0.2.1", "verify_tls": True}
+        pre = capture_snapshot(profile, "user", "synthetic")
+        self.assertIn(common.LEGACY_MAC_COMMAND, capture.call_args.kwargs["commands"])
+        self.assertIn(common.LEGACY_ISIS_COMMAND, capture.call_args.kwargs["commands"])
+        self.assertNotIn(common.MAC_QUERY, capture.call_args.kwargs["commands"])
+        pre["role_commands"] = {"leaf": [common.MAC_QUERY, common.ISIS_QUERY], "spine": [common.ISIS_QUERY]}
+        capture_snapshot(profile, "user", "synthetic", baseline=pre)
+        self.assertEqual(capture.call_args.kwargs["commands"], (common.MAC_QUERY, common.ISIS_QUERY))
+
     @patch.object(common, "ConnectHandler")
     def test_capture_no_mos_found_mac_table_is_successful_and_keeps_raw_output(self, connect):
         output = "\nNo Mos found\n"
@@ -2625,14 +2684,14 @@ class ACISSHDiagnosticsTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
-    def test_saved_legacy_command_lists_upgrade_without_changing_other_custom_commands(self):
+    def test_saved_query_command_lists_restore_show_commands_without_changing_custom_commands(self):
         apic = self.store.save_apic("Migration", "192.0.2.1")
-        legacy = {"leaf": [common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND, "show version"],
-                  "spine": [common.LEGACY_ISIS_COMMAND]}
+        legacy = {"leaf": [common.MAC_QUERY, common.ISIS_QUERY, "show version"],
+                  "spine": [common.ISIS_QUERY]}
         self.store.save_aci_commands(apic, legacy)
         commands = self.store.aci_commands(apic)
-        self.assertEqual(commands["leaf"], (common.MAC_QUERY, common.ISIS_QUERY, "show version"))
-        self.assertEqual(commands["spine"], (common.ISIS_QUERY,))
+        self.assertEqual(commands["leaf"], (common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND, "show version"))
+        self.assertEqual(commands["spine"], (common.LEGACY_ISIS_COMMAND,))
         self.store.save_aci_commands(apic, commands)
         reopened = ProfileStore(self.root / "data", self.root / "keys" / "vault.key")
         self.assertEqual(reopened.aci_commands(apic), commands)

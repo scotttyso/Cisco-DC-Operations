@@ -145,7 +145,7 @@ show interface brief
 show environment
 show module
 show lldp neighbor
-moquery -c isisAdjEp -o json
+show isis adjacency vrf all
 ```
 
 These defaults run on leaf switches only:
@@ -154,19 +154,23 @@ These defaults run on leaf switches only:
 show vpc
 show port-channel summary
 show endpoint summary
-moquery -c epmMacEp -f 'epm.MacEp.flags*"local"' -o json
+show mac address-table dynamic | egrep -v tun
 ```
 
 **Commands by role** contains separate leaf/spine lists, one command per line.
 Additional guarded `show` commands can be entered and saved per APIC using
-**Save role commands**. Only the two exact `moquery` commands above are allowed
+**Save role commands**. Only the two exact previously supported queries
+`moquery -c isisAdjEp -o json` and
+`moquery -c epmMacEp -f 'epm.MacEp.flags*"local"' -o json` remain allowed
 in addition to guarded `show` commands. Other non-show commands, redirection, chaining, and arbitrary
 pipelines are rejected. The known leaf-only command families cannot be assigned
 to spines. Custom show commands may be expensive or expose sensitive data; test
 on one switch and review command support before running them fabric-wide.
-Saved command lists automatically replace the two former MAC/IS-IS show defaults
-for new PRE captures. POST captures retain the commands from their PRE baseline,
-including legacy show commands, so an older baseline remains comparable.
+Saved command lists automatically replace those MAC/IS-IS queries with the
+original show commands for new PRE captures because moquery can time out on
+customer switches. POST captures retain the commands from their PRE baseline,
+including queries, so older baselines remain comparable. Capture a new PRE to
+avoid rerunning queries recorded in an existing baseline.
 
 **Cancel ACI checks** stops queued switches and subsequent commands. In-flight
 APIC/SSH operations finish or reach their configured timeout before connections
@@ -197,9 +201,8 @@ without role metadata are treated as leaf-only; capture a new PRE including
 spines before comparing spine results. The legacy interface-only CLI remains
 leaf-only and does not use WebUI profiles or role-command settings.
 
-Each query above is one complete command, including its quotes where shown.
-Arbitrary pipelines and chaining remain blocked. The former exact MAC-table
-pipeline remains allowed only for compatibility with legacy baselines.
+Each entry is one complete command. Arbitrary pipelines and chaining remain
+blocked; only the exact MAC-table pipeline shown above is permitted.
 Unsupported commands are retained as errors for review;
 ACI release/platform syntax has not been verified against live hardware here.
 
@@ -237,7 +240,12 @@ Controller `active`/`standby` role swaps are ignored; other status changes still
 require review. All later tables, including software/hardware versions and serial
 numbers, are ignored in the comparison. Full raw output remains available.
 This applies to both fixed 1-RU switches and modular chassis.
-The MAC `moquery` compares `addr` and `dn`, ignoring records whose `ifId` contains
+The default MAC show command compares unique MAC-address/port pairs, ignoring
+VLANs, flags, age, type, Secure/NTFY columns, duplicate pairs, and row ordering.
+The default IS-IS show command compares neighbor system IDs, states, and base
+interfaces: `Ethernet1/1.74` and `Ethernet1/1.99` both map to `Ethernet1/1`.
+Only the suffix after the dot is ignored; physical-interface changes require review.
+Previously captured MAC `moquery` output compares `addr` and `dn`, ignoring records whose `ifId` contains
 `tunnel` (case-insensitive). Other attributes and record ordering are ignored.
 The MAC query response `No Mos found` is a successful empty table: it matches
 another empty table, while changes to or from a populated table require review.
@@ -247,7 +255,7 @@ The IS-IS `moquery` compares neighbor `sysId` (or `name` if unavailable) and
 and other attributes are ignored. Invalid JSON or incomplete output where
 `totalCount` does not match `imdata` is not treated as a match; full raw output
 is retained for investigation. Legacy `show isis adjacency vrf all` baselines
-still compare neighbor system IDs and states, ignoring interface renumbering.
+use the same System ID, State, and base-interface comparison.
 `show port-channel summary` matches channels by their physical member interfaces,
 ignoring group/channel IDs and row/member ordering. Member flags, channel flags,
 type, protocol, and membership changes still require review.

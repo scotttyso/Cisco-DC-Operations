@@ -39,19 +39,19 @@ DIAGNOSTIC_COMMANDS = (
     "show environment",
     "show vpc",
     "show port-channel summary",
-    MAC_QUERY,
+    LEGACY_MAC_COMMAND,
     "show endpoint summary",
     "show module",
     "show lldp neighbor",
-    ISIS_QUERY,
+    LEGACY_ISIS_COMMAND,
 )
 SHARED_DIAGNOSTIC_COMMANDS = (
     COMMAND, "show environment", "show module", "show lldp neighbor",
-    ISIS_QUERY,
+    LEGACY_ISIS_COMMAND,
 )
 LEAF_ONLY_COMMANDS = (
     "show vpc", "show port-channel summary", "show endpoint summary",
-    MAC_QUERY,
+    LEGACY_MAC_COMMAND,
 )
 ROLE_COMMANDS = {"leaf": DIAGNOSTIC_COMMANDS, "spine": SHARED_DIAGNOSTIC_COMMANDS}
 
@@ -104,7 +104,7 @@ def validate_role_commands(commands: dict | None = None) -> dict[str, tuple[str,
             assert_read_only(command)
             command = " ".join(command.split())
             leaf_prefixes = [leaf_only.split(" | ")[0].lower()
-                             for leaf_only in (*LEAF_ONLY_COMMANDS, LEGACY_MAC_COMMAND)]
+                             for leaf_only in (*LEAF_ONLY_COMMANDS, MAC_QUERY)]
             if role == "spine" and any(command.lower() == prefix or command.lower().startswith(prefix + " ")
                                        for prefix in leaf_prefixes):
                 raise ValueError(f"{command} is leaf-only")
@@ -116,7 +116,7 @@ def validate_role_commands(commands: dict | None = None) -> dict[str, tuple[str,
 
 def upgraded_role_commands(commands: dict | None) -> dict[str, tuple[str, ...]]:
     validated = validate_role_commands(commands)
-    replacements = {LEGACY_MAC_COMMAND: MAC_QUERY, LEGACY_ISIS_COMMAND: ISIS_QUERY}
+    replacements = {MAC_QUERY: LEGACY_MAC_COMMAND, ISIS_QUERY: LEGACY_ISIS_COMMAND}
     return validate_role_commands({role: [replacements.get(command, command) for command in values]
                                    for role, values in validated.items()})
 
