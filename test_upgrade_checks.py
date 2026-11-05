@@ -192,6 +192,10 @@ class ACIReportUITests(unittest.TestCase):
             rule = web.CSS.split(".report-dialog {", 1)[1].split("}", 1)[0]
             self.assertIn("max-height:92vh", rule)
             self.assertIn("overflow-y:auto", rule)
+            panels_rule = web.CSS.split(".report-dialog > .q-tab-panels {", 1)[1].split("}", 1)[0]
+            self.assertIn("min-height:0", panels_rule)
+            self.assertIn("overflow-y:auto", panels_rule)
+            self.assertIn("flex:1 1 auto", panels_rule)
             expected = ("long output\n" * 6000)[:60000].strip()
             self.assertTrue(any(item.content == expected for item in client.elements.values()
                                 if isinstance(item, ui.code)))

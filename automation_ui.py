@@ -87,6 +87,8 @@ body.body--dark {background:var(--workspace);color:var(--ink);}
 .filter-grid {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;width:100%;}
 .dialog {width:640px;max-width:94vw;border-radius:4px;}
 .report-dialog {width:1100px;max-width:96vw;max-height:92vh;overflow-y:auto;}
+.report-dialog > :not(.q-tab-panels) {flex-shrink:0;}
+.report-dialog > .q-tab-panels {min-height:0;overflow-y:auto;flex:1 1 auto;}
 pre {white-space:pre-wrap;overflow-wrap:anywhere;}
 @media(max-width:700px) {.workspace {padding:20px 14px;}.form-grid,.filter-grid {grid-template-columns:1fr;}
  .brand {font-size:16px;}.account {display:none;}.q-tab-panel {padding-top:18px;}.heading {font-size:22px;}

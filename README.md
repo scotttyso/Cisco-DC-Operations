@@ -251,6 +251,8 @@ ordered by node ID and labeled with switch name, role, and result. These views
 include every switch in the report regardless of the findings filters; the
 existing individual **Inspect result** view remains available.
 Long individual and aggregate report dialogs scroll vertically within the viewport.
+The output tabs scroll independently while the dialog heading and tab controls
+remain visible. This layout applies when opening both new and previously saved reports.
 
 POST reports default to **Result = Needs investigation**, showing only `REVIEW`,
 `ERROR`, and `NO_BASELINE` findings. Choose **REVIEW - changed output** for an
