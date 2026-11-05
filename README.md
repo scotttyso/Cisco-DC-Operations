@@ -176,6 +176,10 @@ avoid rerunning queries recorded in an existing baseline.
 APIC/SSH operations finish or reach their configured timeout before connections
 are closed. The run controls remain disabled during cleanup; a cancelled run
 does not save a completed snapshot.
+If a direct SSH command raises Netmiko `ReadTimeout`, capture stops sending
+commands to that switch and closes the connection. Remaining checks are reported
+as errors with a **Not attempted** explanation; they never count as matches.
+Other switches continue normally.
 
 For SSH/prompt troubleshooting, enable **Capture settings → Record SSH diagnostics
 (password-redacted)** before running a capture (preferably for one node).

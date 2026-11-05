@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException
+from netmiko.exceptions import NetmikoAuthenticationException, ReadTimeout
 from netmiko.session_log import SessionLog
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -363,7 +363,7 @@ def capture_leaf_commands(target: str, username: str, password: str,
         if diagnostics is not None:
             prompt = conn.session.sw_prompt_re if jump else conn.base_prompt
             diagnostic_lines.append(f"Detected base prompt/pattern (repr): {prompt!r}")
-        for command in commands:
+        for index, command in enumerate(commands):
             check_capture_cancelled(cancel_event)
             if diagnostics is not None:
                 diagnostic_lines.append(f"Command: {command}")
@@ -385,6 +385,15 @@ def capture_leaf_commands(target: str, username: str, password: str,
                         results[command].update(status="ERROR", error=str(exc))
             except CaptureCancelled:
                 raise
+            except ReadTimeout as exc:
+                results[command] = {"status": "ERROR", "output": f"{type(exc).__name__}: {exc}"}
+                reason = f"Not attempted: SSH session lost synchronization after ReadTimeout in {command}"
+                for remaining in commands[index + 1:]:
+                    results[remaining] = {"status": "ERROR", "output": reason}
+                if diagnostics is not None:
+                    diagnostic_lines.append(f"Command error: {type(exc).__name__}: {exc}")
+                    diagnostic_lines.append(reason + "; stopping further commands and closing SSH")
+                break
             except Exception as exc:
                 results[command] = {"status": "ERROR", "output": f"{type(exc).__name__}: {exc}"}
                 if diagnostics is not None:

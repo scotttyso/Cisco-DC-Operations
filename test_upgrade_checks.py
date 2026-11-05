@@ -2470,6 +2470,21 @@ class ACICommandComparisonTests(unittest.TestCase):
 
 
 class ACIQueryCaptureTests(unittest.TestCase):
+    @patch.object(common, "ConnectHandler")
+    def test_read_timeout_stops_remaining_commands_and_disconnects(self, connect):
+        session = connect.return_value
+        session.send_command.side_effect = ["first output", common.ReadTimeout("Prompt not detected")]
+        commands = ("show version", "show module", "show vpc", "show port-channel summary")
+        results = common.capture_leaf_commands("switch", "user", "synthetic", commands=commands)
+        self.assertEqual(session.send_command.call_count, 2)
+        self.assertEqual(results["show version"]["status"], "OK")
+        self.assertIn("ReadTimeout: Prompt not detected", results["show module"]["output"])
+        for command in commands[2:]:
+            self.assertEqual(results[command]["status"], "ERROR")
+            self.assertIn("Not attempted", results[command]["output"])
+            self.assertIn("show module", results[command]["output"])
+        session.disconnect.assert_called_once()
+
     @patch("aci_checks.capture_leaf_commands")
     @patch("aci_checks.ApicClient")
     def test_new_pre_restores_show_defaults_but_post_keeps_query_baselines(self, client, capture):
