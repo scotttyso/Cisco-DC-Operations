@@ -1,6 +1,7 @@
 """Switch SSH connections, directly or through a Nexus Dashboard rescue-user shell."""
 
 import contextlib
+import io
 import re
 import runpy
 import shlex
@@ -19,7 +20,7 @@ def jump_helpers():
 
 class NexusDashboardSSH:
     def __init__(self, target: str, username: str, password: str, jump: dict | None, timeout: int,
-                 *, switch_label: str = "ACI switch"):
+                 *, switch_label: str = "ACI switch", diagnostic_log: io.StringIO | None = None):
         hosts = (target, jump.get("host")) if jump is not None else (target,)
         if not all(re.fullmatch(r"[A-Za-z0-9_.:-]+", host or "") for host in hosts):
             raise ValueError("Invalid switch or Nexus Dashboard SSH hostname")
@@ -28,6 +29,8 @@ class NexusDashboardSSH:
         helpers = jump_helpers()
         cfg = {"login_timeout": timeout, "nexus_dashboard": {}, "switches": {}}
         self.session = helpers["SwitchStager"](cfg, target, Path("."), dry_run=True, via_nd=jump is not None)
+        if diagnostic_log is not None:
+            self.session.log_fh = diagnostic_log
         self.session.note = lambda message: None
         options = ["-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "PubkeyAuthentication=no",
                    "-o", f"ConnectTimeout={int(timeout)}", "-o", "ConnectionAttempts=1"]

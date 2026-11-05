@@ -173,6 +173,24 @@ APIC/SSH operations finish or reach their configured timeout before connections
 are closed. The run controls remain disabled during cleanup; a cancelled run
 does not save a completed snapshot.
 
+For SSH/prompt troubleshooting, enable **Capture settings → Record SSH diagnostics
+(password-redacted)** before running a capture (preferably for one node).
+The setting is off by default and affects only that run. **Inspect result**
+then provides an **SSH diagnostics** tab and **Download SSH diagnostics** button.
+The download includes the complete per-switch transcript, login username,
+target, connection method, detected base prompt/pattern, command errors, and a
+`repr` of the received tail to reveal carriage returns/ANSI/control characters.
+Netmiko's timeout error supplies the actual expected pattern, while its received
+session transcript preserves partial output even when `send_command` times out.
+Direct and ND-jump SSH captures are supported; authentication failures also
+retain available diagnostics. PRE and POST transcripts are labeled separately.
+Passwords are redacted, and raw transcripts are buffered in memory rather than
+written to a separate unredacted log file. Transcripts are saved in shared ACI
+snapshots and included in downloaded JSON reports, so treat them as sensitive
+operational data. Normal shared-capture retention/deletion applies. Older
+captures cannot provide a transcript retroactively; rerun with diagnostics
+enabled. Cancelled runs do not persist transcripts.
+
 Each new PRE snapshot records its role-command lists. POST reuses those recorded
 lists even if the saved configuration has since changed. Existing snapshots
 without role metadata are treated as leaf-only; capture a new PRE including

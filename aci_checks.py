@@ -45,7 +45,8 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                      connect_timeout: int = 20, read_timeout: int = 90,
                      dns_domain: str = "", notify=lambda message: None,
                      role: str = "all", role_commands: dict | None = None,
-                     jump: dict | None = None, cancel_event: threading.Event | None = None) -> dict:
+                     jump: dict | None = None, cancel_event: threading.Event | None = None,
+                     ssh_diagnostics: bool = False) -> dict:
     check_capture_cancelled(cancel_event)
     if role not in ("all", "leaf", "spine"):
         raise ValueError("Select all switches, leaf, or spine")
@@ -75,6 +76,7 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
     def collect(leaf):
         target = leaf.get("inb_ip") or leaf.get("oob_ip") or fqdn(leaf["name"], dns_domain)
         entry = {"leaf": leaf, "target": target, "commands": {}, "error": ""}
+        diagnostics = {} if ssh_diagnostics else None
 
         def capture():
             check_capture_cancelled(cancel_event)
@@ -82,7 +84,7 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
                 raise ValueError("Switch has no OOB address or name")
             return capture_leaf_commands(target, username, password, connect_timeout, read_timeout,
                                          commands=command_lists[leaf.get("role", "leaf")],
-                                         jump=jump, cancel_event=cancel_event)
+                                         jump=jump, cancel_event=cancel_event, diagnostics=diagnostics)
 
         try:
             with auth_lock:
@@ -103,6 +105,8 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
             raise
         except Exception as exc:
             entry["error"] = f"{type(exc).__name__}: {exc}"
+        if diagnostics is not None:
+            entry["ssh_diagnostics"] = diagnostics
         notify(f"{leaf.get('role', 'leaf').upper()} {leaf['node_id']} {leaf['name']}: "
                + ("ERROR" if entry["error"] or any(result["status"] != "OK"
                   for result in entry["commands"].values()) else "captured"))
@@ -126,6 +130,19 @@ def capture_snapshot(apic: dict, username: str, password: str, baseline: dict | 
             "captured_at": datetime.now(timezone.utc).isoformat(), "group": group, "role": role,
             "role_commands": command_lists, "dns_domain": dns_domain,
             "ssh_connection": "nexus_dashboard" if jump else "direct", "nodes": entries}
+
+
+def ssh_diagnostic_report(snapshot: dict, baseline: dict | None, node_id: str) -> str:
+    sections = []
+    for phase, capture in (("PRE", baseline), (snapshot.get("phase", "").upper(), snapshot)):
+        if not capture:
+            continue
+        entry = next((entry for entry in capture.get("nodes", [])
+                      if entry["leaf"]["node_id"] == node_id), None)
+        if entry and entry.get("ssh_diagnostics", {}).get("session_log"):
+            sections.append(f"=== {phase} | Node {node_id} | {entry['leaf']['name']} ===\n"
+                            + entry["ssh_diagnostics"]["session_log"])
+    return "\n\n".join(sections)
 
 
 def baseline_role_commands(snapshot: dict) -> dict:

@@ -155,6 +155,44 @@ class AccountUITests(unittest.IsolatedAsyncioTestCase):
 
 
 class ACIReportUITests(unittest.TestCase):
+    def test_individual_inspection_offers_ssh_diagnostics_preview_and_full_download(self):
+        import automation_ui as web
+        from nicegui import ui
+        from nicegui.client import Client
+        transcript = "SSH transcript\n" + "received output\n" * 5000
+        snapshot = {"id": "diagnostic-pre", "phase": "pre", "captured_at": "2026-11-05", "group": "all",
+                    "apic_id": "fabric", "apic": "192.0.2.1",
+                    "role_commands": {"leaf": ["show vpc"], "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": "101", "name": "leaf101"}, "error": "",
+                               "ssh_diagnostics": {"session_log": transcript},
+                               "commands": {"show vpc": {"status": "ERROR", "output": "ReadTimeout"}}}]}
+        with Client(ui.page("/_aci_ssh_diagnostics_test")) as client, \
+                patch.object(web, "owner", return_value="admin"), \
+                patch.object(web, "STORE", create=True) as store, \
+                patch.object(web, "load_snapshots", return_value=[snapshot]), \
+                patch.object(web, "dashboard_picker", side_effect=lambda label: ui.select({}, label=label)), \
+                patch.object(ui.download, "content") as download:
+            store.apics.return_value = [{"id": "fabric", "address": "192.0.2.1"}]
+            store.user.return_value = {"role": "operator"}
+            web.aci_panel(ui.select({"fabric": "Fabric"}, value="fabric"))
+            checkbox = next(item for item in client.elements.values()
+                            if getattr(item, "text", "") == "Record SSH diagnostics (password-redacted)")
+            self.assertFalse(checkbox.value)
+            history = next(item for item in client.elements.values() if item._props.get("label") == "Snapshot")
+            history.value = snapshot["id"]
+            table = next(item for item in client.elements.values() if isinstance(item, ui.table) and item.row_key == "id")
+            table.selected = table.rows[:1]
+            def click(label):
+                button = next(item for item in client.elements.values() if item._props.get("label") == label)
+                handler = next(listener.handler for listener in button._event_listeners.values() if listener.type == "click")
+                inspect.getclosurevars(handler).nonlocals["callback"]()
+            click("Inspect result")
+            self.assertTrue(any(item._props.get("name") == "SSH diagnostics" for item in client.elements.values()
+                                if isinstance(item, ui.tab)))
+            click("Download SSH diagnostics")
+            self.assertIn(transcript, download.call_args.args[0])
+            self.assertEqual(download.call_args.kwargs["filename"], "aci-diagnostic-pre-node-101-ssh.txt")
+
     def test_long_individual_report_scrolls_and_query_labels_are_display_only(self):
         import automation_ui as web
         from nicegui import ui
@@ -286,6 +324,7 @@ class ACICancelUITests(unittest.IsolatedAsyncioTestCase):
         from nicegui.client import Client
         started = threading.Event()
         def cancelled_capture(*args, **kwargs):
+            self.assertTrue(kwargs["ssh_diagnostics"])
             started.set()
             if not kwargs["cancel_event"].wait(5):
                 raise AssertionError("Cancel button did not signal capture")
@@ -314,6 +353,10 @@ class ACICancelUITests(unittest.IsolatedAsyncioTestCase):
             store.dns_domain.return_value = ""
             apic = ui.select({"fabric": "Fabric"}, value="fabric")
             web.aci_panel(apic)
+            checkbox = next(item for item in client.elements.values()
+                            if getattr(item, "text", "") == "Record SSH diagnostics (password-redacted)")
+            self.assertFalse(checkbox.value)
+            checkbox.value = True
             start = next(item for item in client.elements.values() if item._props.get("label") == "Run ACI checks")
             cancel = next(item for item in client.elements.values() if item._props.get("label") == "Cancel ACI checks")
             self.assertFalse(cancel.enabled)
@@ -2472,6 +2515,113 @@ class ACIQueryCaptureTests(unittest.TestCase):
         self.assertEqual(capture.call_args.kwargs["commands"],
                          (common.LEGACY_MAC_COMMAND, common.LEGACY_ISIS_COMMAND))
         self.assertTrue(all(row["state"] == "MATCH" for row in compare_snapshots(baseline, post)))
+
+
+class ACISSHDiagnosticsTests(unittest.TestCase):
+    @patch.object(common, "ConnectHandler")
+    def test_timeout_retains_partial_output_actual_pattern_and_redacts_split_secrets(self, connect):
+        from netmiko.exceptions import ReadTimeout
+        diagnostics = {}
+        secret = "synthetic-password-123"
+        raw = "partial output\r\n\x1b[0mother-prompt#"
+
+        def connection(**kwargs):
+            log = kwargs["session_log"]
+            log.write("login " + secret[:10])
+            log.write(secret[10:] + "\n")
+            session = MagicMock(base_prompt="expected-switch")
+            def command(*args, **options):
+                log.write(raw)
+                raise ReadTimeout("Pattern not detected: 'expected-switch\\\\#' in output.")
+            session.send_command.side_effect = command
+            return session
+
+        connect.side_effect = connection
+        result = common.capture_leaf_commands("192.0.2.1", "apic:AAA\\user", secret,
+                                              commands=("show vpc",), diagnostics=diagnostics)
+        self.assertEqual(result["show vpc"]["status"], "ERROR")
+        text = diagnostics["session_log"]
+        self.assertIn(raw, text)
+        self.assertIn("expected-switch", text)
+        self.assertIn("Pattern not detected", text)
+        self.assertIn("SSH username: apic:AAA\\user", text)
+        self.assertIn("SSH target: 192.0.2.1:22", text)
+        self.assertIn("\\r\\n\\x1b", text)
+        self.assertNotIn(secret, text)
+        self.assertFalse(connect.call_args.kwargs["session_log"].record_writes)
+
+    @patch.object(common, "ConnectHandler")
+    def test_connection_failure_still_produces_diagnostics_without_password(self, connect):
+        diagnostics = {}
+        secret = "synthetic-password"
+        def rejected(**kwargs):
+            kwargs["session_log"].write("login banner\n")
+            raise common.NetmikoAuthenticationException(f"Authentication failed: {secret}")
+        connect.side_effect = rejected
+        with self.assertRaises(common.NetmikoAuthenticationException):
+            common.capture_leaf_commands("192.0.2.1", "user", secret, diagnostics=diagnostics)
+        self.assertIn("login banner", diagnostics["session_log"])
+        self.assertIn("Authentication failed", diagnostics["session_log"])
+        self.assertNotIn(secret, diagnostics["session_log"])
+
+    @patch.object(common, "ConnectHandler")
+    def test_session_logging_is_disabled_by_default(self, connect):
+        connect.return_value.send_command.return_value = "output"
+        common.capture_leaf_commands("switch", "user", "synthetic", commands=("show vpc",))
+        self.assertIsNone(connect.call_args.kwargs["session_log"])
+
+    @patch("aci_jump.NexusDashboardSSH")
+    def test_jump_logs_received_output_and_redacts_switch_and_rescue_passwords(self, connection):
+        diagnostics = {}
+        def jump(*args, **kwargs):
+            kwargs["diagnostic_log"].write("switch-secret rescue-secret\r\npartial output\x1b[0m")
+            session = MagicMock()
+            session.session.sw_prompt_re = r"switch\#\s*$"
+            session.send_command.side_effect = TimeoutError("Switch prompt not detected")
+            return session
+        connection.side_effect = jump
+        result = common.capture_leaf_commands("switch", "user", "switch-secret",
+                                              commands=("show vpc",),
+                                              jump={"host": "nd", "password": "rescue-secret"},
+                                              diagnostics=diagnostics)
+        self.assertEqual(result["show vpc"]["status"], "ERROR")
+        text = diagnostics["session_log"]
+        self.assertIn("Nexus Dashboard jump", text)
+        self.assertIn("partial output", text)
+        self.assertIn("Switch prompt not detected", text)
+        self.assertNotIn("switch-secret", text)
+        self.assertNotIn("rescue-secret", text)
+
+    @patch("aci_checks.capture_leaf_commands")
+    def test_snapshots_persist_per_switch_diagnostics_and_pre_post_report(self, capture):
+        from aci_checks import ssh_diagnostic_report
+        baseline = {"id": "pre", "apic_id": "fabric", "apic": "192.0.2.1", "phase": "pre",
+                    "role_commands": {"leaf": ["show vpc"], "spine": ["show module"]},
+                    "nodes": [{"leaf": {"node_id": str(node), "name": f"leaf{node}", "oob_ip": f"192.0.2.{node}"},
+                               "error": "", "commands": {"show vpc": {"status": "OK", "output": "stable"}},
+                               "ssh_diagnostics": {"session_log": f"PRE transcript {node}"}}
+                              for node in (101, 102)]}
+        def capture_commands(target, *args, **kwargs):
+            kwargs["diagnostics"]["session_log"] = f"POST transcript {target}"
+            return {"show vpc": {"status": "OK", "output": "stable"}}
+        capture.side_effect = capture_commands
+        snapshot = capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic",
+                                    baseline=baseline, ssh_diagnostics=True)
+        with tempfile.TemporaryDirectory() as directory:
+            saved = save_snapshot(Path(directory), snapshot)
+            restored = json.loads(saved.read_text())
+        text = ssh_diagnostic_report(restored, baseline, "101")
+        self.assertIn("PRE transcript 101", text)
+        self.assertIn("POST transcript 192.0.2.101", text)
+        self.assertNotIn("102", text)
+        for node in baseline["nodes"]:
+            node.pop("ssh_diagnostics")
+        self.assertEqual(ssh_diagnostic_report(baseline, None, "101"), "")
+        capture.side_effect = None
+        capture.return_value = {"show vpc": {"status": "OK", "output": "stable"}}
+        no_diagnostics = capture_snapshot({"id": "fabric", "address": "192.0.2.1"}, "user", "synthetic",
+                                         baseline=baseline)
+        self.assertTrue(all("ssh_diagnostics" not in entry for entry in no_diagnostics["nodes"]))
 
 
 class ProfileTests(unittest.TestCase):

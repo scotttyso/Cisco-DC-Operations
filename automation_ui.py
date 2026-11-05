@@ -30,7 +30,7 @@ from fastapi.responses import RedirectResponse
 from nicegui import app, run, ui
 
 from aci_checks import (ATTENTION_STATES, capture_snapshot, delete_old_snapshots, filter_results, load_snapshots,
-                        save_snapshot, snapshot_results, summarize_results)
+                        save_snapshot, snapshot_results, ssh_diagnostic_report, summarize_results)
 from aci_ifstatus_common import (DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, CaptureCancelled,
                                check_capture_cancelled, command_label, validate_role_commands)
 from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
@@ -705,6 +705,11 @@ def aci_panel(apic_selector):
                 workers = ui.number("Parallel switches", value=20, min=1, max=32, precision=0).props("outlined dense")
                 connect_timeout = ui.number("SSH connection timeout (seconds)", value=20, min=1, precision=0).props("outlined dense")
                 read_timeout = ui.number("Per-command timeout (seconds)", value=90, min=1, precision=0).props("outlined dense")
+            ssh_diagnostics = ui.checkbox("Record SSH diagnostics (password-redacted)", value=False)
+            ui.label("Opt-in per run. Transcripts include switch output and login identity, including partial "
+                     "output on timeout, and are saved in shared ACI reports. They may contain sensitive "
+                     "operational data. Inspect a result to view/download. Older captures have no transcript "
+                     "unless diagnostics were enabled when they ran.").classes("muted")
         with ui.expansion("Commands by role", icon="list").classes("w-full"):
             ui.label("POST uses the command lists recorded in its PRE baseline.").classes("muted")
             with ui.column().classes("w-full").bind_visibility_from(phase, "value", value="pre"):
@@ -806,7 +811,7 @@ def aci_panel(apic_selector):
                                 connect_timeout=int(connect_timeout.value), read_timeout=int(read_timeout.value),
                                 notify=messages.put, role=capture_role.value, dns_domain=STORE.dns_domain(),
                                 role_commands=command_values() if before is None else None, jump=jump,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event, ssh_diagnostics=bool(ssh_diagnostics.value))
                 cancel_event.clear()
                 run_button.disable()
                 cancel_button.enable()
@@ -917,19 +922,30 @@ def aci_panel(apic_selector):
                     ui.notify("Select a result", type="warning")
                     return
                 row = next(result for result in all_results if result["id"] == table.selected[0]["id"])
+                diagnostics = ssh_diagnostic_report(
+                    current_snapshot, snapshots.get(current_snapshot.get("baseline_id")), row["node_id"])
                 with ui.dialog() as dialog, ui.card().classes("report-dialog"):
                     with ui.row().classes("w-full items-center"):
                         ui.label(f"Node {row['node_id']} | {command_label(row['command'])} | {row['state']}").classes("section-title")
                         ui.space()
                         ui.button(icon="close", on_click=dialog.close).props('flat round aria-label="Close report"').tooltip("Close report")
+                    if diagnostics:
+                        ui.button("Download SSH diagnostics", icon="download", on_click=lambda: ui.download.content(
+                            diagnostics, filename=f"aci-{current_snapshot['id']}-node-{row['node_id']}-ssh.txt")).props("outline")
                     with ui.tabs().classes("w-full") as detail_tabs:
                         for label in ("Difference", "Pre", "Post"):
                             ui.tab(label)
+                        if diagnostics:
+                            ui.tab("SSH diagnostics")
                     with ui.tab_panels(detail_tabs, value="Pre" if current_snapshot["phase"] == "pre" else "Difference").classes("w-full"):
                         for label, name in (("Difference", "detail"), ("Pre", "pre"), ("Post", "post")):
                             with ui.tab_panel(label):
                                 ui.code((row[name] or "No output")[:60000],
                                         language="diff" if name == "detail" else "text").classes("w-full")
+                        if diagnostics:
+                            with ui.tab_panel("SSH diagnostics"):
+                                ui.label("Preview limited to 60,000 characters; download for the complete transcript.").classes("muted")
+                                ui.code(diagnostics[:60000], language="text").classes("w-full")
                 dialog.open()
 
             def download():
