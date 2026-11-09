@@ -33,6 +33,11 @@ telemetry
     snsr-grp 500 sample-interval 295000
 end
 """
+ND_MANAGEMENT_TEMPLATE = TEMPLATE.replace(
+    "feature telemetry", "feature lldp\nfeature icam\nfeature telemetry"
+).replace(
+    "feature grpc", "feature grpc\nhardware profile dme load-interval 10"
+).replace("use-vrf default", "use-vrf management").replace("    source-interface vlan64\n", "")
 INVENTORY = [{"serial": "SERIAL1", "name": "leaf1", "address": "192.0.2.101", "fabric": "Fabric / A"},
              {"serial": "SERIAL2", "name": "leaf2", "address": "192.0.2.102", "fabric": "Fabric / A"}]
 SELECTION = {"switches": {"username": "netops", "hosts": ["leaf1"]}, "source_interfaces": {}}
@@ -107,6 +112,18 @@ class TelemetryInputTests(unittest.TestCase):
             with self.subTest(template=template), self.assertRaises(ValueError):
                 configuration_lines(template)
 
+    def test_configuration_accepts_dme_load_interval_but_not_other_hardware_commands(self):
+        lines = configuration_lines(ND_MANAGEMENT_TEMPLATE)
+        self.assertIn("hardware profile dme load-interval 10", lines)
+        self.assertEqual(lines[-1], "    snsr-grp 500 sample-interval 295000")
+        for command in ("hardware profile dme load-interval", "hardware profile dme load-interval invalid",
+                        "hardware profile dme load-interval 10; reload",
+                        "hardware profile dme load-interval 10 extra",
+                        "hardware profile other 10", "reload"):
+            template = ND_MANAGEMENT_TEMPLATE.replace("hardware profile dme load-interval 10", command)
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, "Unsupported top-level"):
+                configuration_lines(template)
+
 
 class TelemetryPreviewTests(unittest.TestCase):
     def service(self, vrf="default", template=TEMPLATE, valid=True, hosts=None, switch_vrf=None, switch_interface=None):
@@ -175,6 +192,13 @@ class TelemetryPreviewTests(unittest.TestCase):
         paths = [call.args[1] for call in service.client.request.call_args_list]
         self.assertEqual(paths[2], "/manage/fabrics/Fabric%20%2F%20A")
         self.assertEqual(paths[3], "/analyze/telemetry/switchesConfig?fabricName=Fabric+%2F+A&switchId=SERIAL1")
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_management_preserves_nd_dme_load_interval_without_ssh(self, ssh):
+        plans = self.service(vrf="management", template=ND_MANAGEMENT_TEMPLATE).preview(SELECTION, "secret", None)
+        self.assertEqual(plans[0]["template"], ND_MANAGEMENT_TEMPLATE)
+        self.assertEqual(plans[0]["source"], "ND template unchanged")
+        ssh.assert_not_called()
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_default_and_inband_discover_per_switch_and_close_both_hops(self, ssh):
@@ -353,6 +377,15 @@ class TelemetryPushTests(unittest.TestCase):
         self.assertEqual(log[-1], "Copy complete.")
         self.assertIn('path "show processes cpu" depth unbounded', commands)
         self.assertRegex("leaf1(config-tm-dest)#", connection.session.sw_prompt_re)
+
+    def test_push_applies_dme_load_interval_before_telemetry_and_saves(self):
+        connection = self.connection()
+        connection.push(ND_MANAGEMENT_TEMPLATE)
+        commands = [call.args[0] for call in connection.session.cmd.call_args_list]
+        self.assertEqual(commands[:7], ["configure terminal", "feature lldp", "feature icam",
+                                       "feature telemetry", "feature grpc",
+                                       "hardware profile dme load-interval 10", "telemetry"])
+        self.assertEqual(commands[-2:], ["end", "copy running-config startup-config"])
 
     def test_cli_errors_abort_and_force_close_without_sending_later_commands(self):
         for message in ("% Invalid command at '^' marker.", "ERROR: denied", "% Permission denied"):

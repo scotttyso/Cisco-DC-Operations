@@ -147,7 +147,9 @@ def configuration_lines(template: str) -> list[str]:
         raise ValueError("ND softwareConfiguration does not contain a telemetry configuration")
     for line in lines:
         command = line.strip()
-        if not line.startswith(" ") and command != "telemetry" and not re.fullmatch(r"feature [a-zA-Z0-9_-]+", command):
+        if not line.startswith(" ") and command != "telemetry" and not re.fullmatch(
+            r"(?:feature [a-zA-Z0-9_-]+|hardware profile dme load-interval [0-9]+)", command
+        ):
             raise ValueError(f"Unsupported top-level telemetry command: {command}")
         if re.match(r"(?i)(?:end|exit|configure|do|run|reload|copy|write|bash|python|guestshell)\b", command):
             raise ValueError(f"Unsupported telemetry command: {command}")

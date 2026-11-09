@@ -506,6 +506,8 @@ software telemetry configuration from ND to a list of switches.
    `management`) when the inventory has no value. It then reads each switch's
    `/api/v1/analyze/telemetry/switchesConfig?fabricName=<fabric>&switchId=<serial>`.
    Only a valid `softwareConfiguration` is used; flow telemetry is not included.
+   The template's `hardware profile dme load-interval <integer>` command is supported
+   and preserved alongside its feature and telemetry configuration.
    A `management` VRF leaves the ND template unchanged.
    For `default` (as returned in inband fabrics) and `inband`, the source interface is
    taken from a YAML override, else the inventory `sourceInterfaceName`, else discovered
