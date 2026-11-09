@@ -536,8 +536,21 @@ software telemetry configuration from ND to a list of switches.
    Set parallel switches to **1** for sequential pushes. Each concurrent switch
    uses its own SSH session and log, including when using the ND rescue-user hop.
    SSH timeouts also apply to preview interface discovery; preview remains sequential.
+   The ND rescue-user hop runs switch SSH with `-B bond0` to bind the ND-to-switch
+   connection to `bond0`, including legacy-SSH retries. This does not change the
+   application-to-ND connection, direct switch SSH, or ACI Checks routing.
    Startup-config saves allow at least **300 seconds**, or the configured per-command
    timeout if larger.
+   Enable **Record SSH diagnostics (password-redacted)** to capture login stages,
+   the switch SSH command, prompts, received output, and an escaped transcript tail.
+   This is off by default and covers both preview interface discovery and push,
+   including login failures. Expand **SSH diagnostics** below the logs to view or
+   download each switch's diagnostics. Both switch and rescue-user passwords are
+   redacted, but device and network details can remain; review before sharing.
+   Preview diagnostics are saved in private `telemetry/<run-id>/preview-ssh.json`
+   files under your account's run directory. Push diagnostics are included in the
+   switch logs and JSON push report. No diagnostics are produced for a preview
+   that does not require switch SSH, and earlier runs cannot be diagnosed retroactively.
 6. **Push telemetry** requires confirmation and applies the reviewed configuration
    to running-config via the selected SSH route, then runs
    `copy running-config startup-config` after each successful switch push.
@@ -548,6 +561,8 @@ software telemetry configuration from ND to a list of switches.
    no new switches are started; switches already in progress finish their
    configuration and save. Switches that have not started are marked
    **NOT_ATTEMPTED**. A failed switch may have partial changes.
+   A connection/login failure before configuration starts explicitly reports that
+   no telemetry configuration was sent.
    A save failure is reported as **FAILED**, even though telemetry may already be
    applied to running-config; no new switches are started.
 7. Watch the live log for each command and its response, prefixed with its switch

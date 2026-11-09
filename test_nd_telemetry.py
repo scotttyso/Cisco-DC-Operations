@@ -1,5 +1,6 @@
 import copy
 import inspect
+import io
 import re
 import tempfile
 import threading
@@ -240,6 +241,41 @@ class TelemetryPreviewTests(unittest.TestCase):
             self.service().preview(SELECTION, "secret", {"password": "rescue"})
         ssh.return_value.disconnect.assert_called_once()
         ssh.return_value.push.assert_not_called()
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_preview_diagnostics_survive_login_failure_and_redact_both_passwords(self, ssh):
+        password = "switch\nsecret"
+        jump = {"host": "nd.example", "password": "rescue-secret"}
+
+        def fail(*args, diagnostic_log):
+            diagnostic_log.write(f"ND ready\r\n{password} rescue-secret\x1b[0m")
+            raise RuntimeError(f"NX-OS switch: timed out waiting for login {password}")
+
+        ssh.side_effect = fail
+        diagnostics = []
+        with self.assertRaisesRegex(RuntimeError, "timed out waiting for login"):
+            self.service().preview(SELECTION, password, jump, diagnostics=diagnostics)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["serial"], "SERIAL1")
+        text = diagnostics[0]["ssh_diagnostics"]["session_log"]
+        self.assertIn("bond0", text)
+        self.assertIn("ND ready", text)
+        self.assertIn("Session error: RuntimeError", text)
+        self.assertIn("\\r\\n", text)
+        self.assertNotIn(password, text)
+        self.assertNotIn(repr(password)[1:-1], text)
+        self.assertNotIn(jump["password"], text)
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_preview_diagnostics_are_only_created_when_ssh_is_needed(self, ssh):
+        diagnostics = []
+        self.service(vrf="management").preview(SELECTION, "secret", None, diagnostics=diagnostics)
+        self.assertEqual(diagnostics, [])
+        ssh.assert_not_called()
+        ssh.return_value.discover.return_value = "Vlan72"
+        self.service().preview(SELECTION, "secret", None, diagnostics=diagnostics)
+        self.assertIn("direct SSH", diagnostics[0]["ssh_diagnostics"]["session_log"])
+        ssh.return_value.disconnect.assert_called_once()
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_missing_vrf_field_is_management(self, ssh):
@@ -500,6 +536,88 @@ class TelemetryPushTests(unittest.TestCase):
         ssh.return_value.disconnect.assert_called_once()
 
     @patch("nd_telemetry.TelemetrySSH")
+    def test_login_failure_diagnostics_are_private_redacted_and_configuration_is_not_sent(self, ssh):
+        def fail(*args, diagnostic_log):
+            diagnostic_log.write("ND shell ready\r\nswitch-secret rescue-secret\x1b[0m\nssh -B bond0\n")
+            raise RuntimeError("NX-OS switch: timed out waiting for login")
+
+        ssh.side_effect = fail
+        log = []
+        with tempfile.TemporaryDirectory() as temporary:
+            results = push_plans([{**switch, "template": TEMPLATE} for switch in INVENTORY],
+                                 "netops", "switch-secret", {"host": "nd.example", "password": "rescue-secret"},
+                                 log.append, Path(temporary), ssh_diagnostics=True)
+            self.assertEqual([result["state"] for result in results], ["FAILED", "NOT_ATTEMPTED"])
+            self.assertIn("no telemetry configuration was sent", results[0]["detail"])
+            self.assertNotIn("partially applied", results[0]["detail"])
+            text = results[0]["ssh_diagnostics"]["session_log"]
+            self.assertIn("ssh -B bond0", text)
+            self.assertIn("timed out waiting for login", text)
+            self.assertIn("\\x1b", text)
+            self.assertNotIn("ssh_diagnostics", results[1])
+            path = Path(temporary) / results[0]["log_file"]
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertIn(text, path.read_bytes().decode("utf-8"))
+            output = str(results) + str(log) + path.read_text()
+            self.assertNotIn("switch-secret", output)
+            self.assertNotIn("rescue-secret", output)
+            ssh.assert_called_once()
+            ssh.return_value.push.assert_not_called()
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_push_diagnostics_are_opt_in_and_capture_disconnect(self, ssh):
+        plan = {**INVENTORY[0], "template": TEMPLATE}
+        results = push_plans([plan], "netops", "secret", None, lambda _: None)
+        self.assertNotIn("ssh_diagnostics", results[0])
+        self.assertNotIn("diagnostic_log", ssh.call_args.kwargs)
+
+        def connect(*args, diagnostic_log):
+            connection = MagicMock()
+            diagnostic_log.write("connected\n")
+            connection.disconnect.side_effect = lambda: diagnostic_log.write("disconnected\n")
+            return connection
+
+        ssh.side_effect = connect
+        results = push_plans([plan], "netops", "secret", None, lambda _: None, ssh_diagnostics=True)
+        self.assertEqual(results[0]["state"], "PUSHED")
+        self.assertIn("direct SSH", results[0]["ssh_diagnostics"]["session_log"])
+        self.assertIn("disconnected", results[0]["ssh_diagnostics"]["session_log"])
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_parallel_ssh_diagnostics_are_isolated_per_switch(self, ssh):
+        barrier = threading.Barrier(2)
+
+        def connect(address, *args, diagnostic_log):
+            connection = MagicMock()
+            diagnostic_log.write(f"session for {address}\n")
+            connection.push.side_effect = lambda *args: barrier.wait(timeout=5)
+            return connection
+
+        ssh.side_effect = connect
+        results = push_plans([{**switch, "template": TEMPLATE} for switch in INVENTORY],
+                             "netops", "secret", None, lambda _: None, workers=2, ssh_diagnostics=True)
+        self.assertEqual([result["state"] for result in results], ["PUSHED", "PUSHED"])
+        for index, result in enumerate(results):
+            text = result["ssh_diagnostics"]["session_log"]
+            self.assertIn(INVENTORY[index]["address"], text)
+            self.assertNotIn(INVENTORY[1 - index]["address"], text)
+
+    @patch("nd_telemetry.TelemetrySSH")
+    def test_passwords_are_redacted_before_formatting_the_escaped_transcript_tail(self, ssh):
+        for password in ("secret'\"value", "secret\\value", "secret\nvalue"):
+            with self.subTest(password=password):
+                def connect(*args, diagnostic_log):
+                    diagnostic_log.write(f"echo {password}\r\n")
+                    return MagicMock()
+
+                ssh.side_effect = connect
+                results = push_plans([{**INVENTORY[0], "template": TEMPLATE}], "netops", password,
+                                     None, lambda _: None, ssh_diagnostics=True)
+                text = results[0]["ssh_diagnostics"]["session_log"]
+                self.assertNotIn(password, text)
+                self.assertIn(repr("echo [REDACTED]\r\n"), text)
+
+    @patch("nd_telemetry.TelemetrySSH")
     def test_direct_push_success_and_failure_without_rescue_credentials(self, ssh):
         plans = [{**switch, "template": TEMPLATE} for switch in INVENTORY]
         log = []
@@ -526,6 +644,37 @@ class TelemetryPushTests(unittest.TestCase):
 
 class DirectSSHTests(unittest.TestCase):
     @patch("aci_jump.jump_helpers")
+    def test_nd_switch_hop_binds_bond0_including_legacy_retry_and_records_stages(self, helpers):
+        session = MagicMock()
+        session._capture_prompt.side_effect = ["rescue@nd:~$", "leaf1#"]
+        session._authenticate.side_effect = [None, RuntimeError("invalid key length"), None]
+        helpers.return_value = {
+            "SwitchStager": MagicMock(return_value=session), "StageError": RuntimeError,
+            "ND_GENERIC_PROMPT": r"nd.*\$", "SWITCH_GENERIC_PROMPT": r"leaf1#",
+            "LEGACY_ERR_RE": re.compile("invalid key length"),
+            "LEGACY_SSH_OPTIONS": ["-o", "HostKeyAlgorithms=+ssh-rsa"],
+        }
+        diagnostic_log = io.StringIO()
+        connection = TelemetrySSH("leaf1.example", "netops", "switch-secret",
+                                  {"host": "nd.example", "password": "rescue-secret"}, diagnostic_log=diagnostic_log)
+        outer = session._spawn.call_args.args[0]
+        self.assertNotIn("-B", outer)
+        inner = [call.args[0] for call in session.child.sendline.call_args_list]
+        self.assertEqual(len(inner), 2)
+        self.assertTrue(all(command.startswith("ssh -B bond0 ") for command in inner))
+        self.assertNotIn("HostKeyAlgorithms", inner[0])
+        self.assertIn("HostKeyAlgorithms=+ssh-rsa", inner[1])
+        self.assertIs(session.log_fh, diagnostic_log)
+        text = diagnostic_log.getvalue()
+        self.assertIn("Connecting to Nexus Dashboard nd.example as rescue-user", text)
+        self.assertIn("Nexus Dashboard prompt (repr)", text)
+        self.assertIn("retrying with legacy SSH", text)
+        self.assertIn("Switch prompt (repr)", text)
+        self.assertNotIn("switch-secret", text)
+        self.assertNotIn("rescue-secret", text)
+        connection.disconnect()
+
+    @patch("aci_jump.jump_helpers")
     def test_direct_connection_spawns_switch_ssh_without_nd_login(self, helpers):
         session = MagicMock()
         session._capture_prompt.return_value = "leaf1#"
@@ -539,6 +688,7 @@ class DirectSSHTests(unittest.TestCase):
         arguments = session._spawn.call_args.args[0]
         self.assertEqual(arguments[-4:], ["-l", "netops", "--", "leaf1.example"])
         self.assertNotIn("switch-secret", str(arguments))
+        self.assertNotIn("-B", arguments)
         session._authenticate.assert_called_once_with("switch-secret", r"leaf1#", "NX-OS switch", [])
         session.child.sendline.assert_not_called()
         connection.disconnect()
@@ -572,6 +722,56 @@ class DirectSSHTests(unittest.TestCase):
 
 
 class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_preview_login_failure_diagnostics_are_saved_and_downloadable(self):
+        import automation_ui
+        from nicegui import ui
+
+        profile = {"id": "nd1", "name": "ND", "address": "nd.example"}
+        store = MagicMock()
+        store.credentials.return_value = {}
+        store.dashboards.return_value = [profile]
+        text = "SSH source bond0\nSession error: timed out waiting for login\n[REDACTED]"
+
+        def fail(*args, diagnostics):
+            diagnostics.append({**INVENTORY[0], "ssh_diagnostics": {"session_log": text}})
+            raise RuntimeError("NX-OS switch: timed out waiting for login")
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(automation_ui, "STORE", store, create=True), \
+                patch.object(automation_ui, "owner", return_value="tester"), \
+                patch.object(automation_ui, "TelemetryPush") as service, \
+                patch.object(automation_ui, "saved_credentials", return_value={"password": "api-secret"}), \
+                patch.object(automation_ui, "ssh_jump", return_value={"host": "nd.example", "password": "rescue-secret"}), \
+                patch.object(automation_ui, "output_directory", return_value=Path(temporary)), \
+                patch.object(ui, "notify"), \
+                patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
+                             side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)):
+            service.return_value.preview.side_effect = fail
+            elements, buttons, config, password = self.telemetry_form()
+            dashboard = next(element for element in elements if isinstance(element, ui.select)
+                             and element._props.get("label") == "Nexus Dashboard appliance")
+            dashboard.value = "nd1"
+            config.value = "switches:\n  username: netops\n  hosts: [leaf1]\n"
+            password.value = "switch-secret"
+            checkbox = next(element for element in elements if isinstance(element, ui.checkbox)
+                            and element.text == "Record SSH diagnostics (password-redacted)")
+            checkbox.value = True
+            await self.click_callback(buttons["Preview telemetry"])()
+            service.return_value.close.assert_called_once()
+            reports = list(Path(temporary).glob("telemetry/*/preview-ssh.json"))
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(reports[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(reports[0].parent.stat().st_mode & 0o777, 0o700)
+            self.assertIn("timed out waiting for login", reports[0].read_text())
+            self.assertTrue(checkbox.enabled)
+            self.assertFalse(buttons["Push telemetry"].enabled)
+            client = checkbox.client
+            download_button = next(element for element in client.elements.values() if isinstance(element, ui.button)
+                                   and element.text == "Download SSH diagnostics")
+            with patch.object(ui.download, "content") as download:
+                self.click_callback(download_button)()
+                download.assert_called_once_with(text, filename="telemetry-SERIAL1-ssh.txt")
+
     async def test_invalid_push_settings_prevent_preview(self):
         import automation_ui
         from nicegui import ui
@@ -708,7 +908,13 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
     async def test_remember_still_saves_credentials_during_preview(self):
         await self.exercise_workflow(False, remember_credentials=True)
 
-    async def exercise_workflow(self, direct_connection, saved=False, remember_credentials=False):
+    async def test_nd_diagnostics_option_is_wired_to_preview_push_and_download(self):
+        await self.exercise_workflow(False, diagnostics_enabled=True)
+
+    async def test_direct_diagnostics_option_is_wired_to_preview_push_and_download(self):
+        await self.exercise_workflow(True, diagnostics_enabled=True)
+
+    async def exercise_workflow(self, direct_connection, saved=False, remember_credentials=False, diagnostics_enabled=False):
         import automation_ui
         from nicegui import ui
         from nicegui.client import Client
@@ -728,18 +934,30 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         preview_routes = []
         push_routes = []
 
-        def capture_preview(selection, password, jump, connect_timeout, read_timeout):
+        diagnostic_text = "Connection stages\nReceived SSH transcript:\n[REDACTED]"
+
+        def capture_preview(selection, password, jump, connect_timeout, read_timeout, **kwargs):
             self.assertEqual((connect_timeout, read_timeout), (20, 90))
             preview_routes.append(None if jump is None else jump.copy())
+            if diagnostics_enabled:
+                kwargs["diagnostics"].append({**INVENTORY[0], "ssh_diagnostics": {"session_log": diagnostic_text}})
+            else:
+                self.assertEqual(kwargs, {})
             return plans
 
-        def capture_push(plans, username, password, jump, notify, directory, workers, connect_timeout, read_timeout):
+        def capture_push(plans, username, password, jump, notify, directory, workers, connect_timeout, read_timeout, **kwargs):
             self.assertEqual((workers, connect_timeout, read_timeout), (4, 35, 150))
             push_routes.append(None if jump is None else jump.copy())
             path = directory / "switch-1.log"
             path.touch(mode=0o600)
             path.write_text("> feature telemetry\n> copy running-config startup-config\nCopy complete.\n")
-            return [{**INVENTORY[0], "state": "PUSHED", "log_file": path.name}]
+            result = {**INVENTORY[0], "state": "PUSHED", "log_file": path.name}
+            if diagnostics_enabled:
+                self.assertEqual(kwargs, {"ssh_diagnostics": True})
+                result["ssh_diagnostics"] = {"session_log": diagnostic_text}
+            else:
+                self.assertEqual(kwargs, {})
+            return [result]
 
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(automation_ui, "STORE", store, create=True), \
@@ -752,7 +970,7 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                              side_effect=lambda _: {"host": "nd.example", "password": "rescue-secret"}) as jump, \
                 patch.object(automation_ui, "output_directory", return_value=Path(temporary)), \
                 patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
-                             side_effect=lambda function, *args: function(*args)):
+                             side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)):
             service.return_value.preview.side_effect = capture_preview
             client = Client(page("/telemetry-test"))
             self.addCleanup(client.delete)
@@ -774,6 +992,10 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(numbers["Parallel switches"]._props["max"], 32)
                 self.assertEqual(numbers["SSH connection timeout (seconds)"].value, 20)
                 self.assertEqual(numbers["Per-command timeout (seconds)"].value, 90)
+                checkbox = next(element for element in elements if isinstance(element, ui.checkbox)
+                                and element.text == "Record SSH diagnostics (password-redacted)")
+                self.assertFalse(checkbox.value)
+                checkbox.value = diagnostics_enabled
                 if saved:
                     self.assertEqual(yaml_field.value, text)
                     self.assertEqual(password.value, "")
@@ -824,6 +1046,13 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(reports), 1)
                 self.assertNotIn("secret", reports[0].read_text())
                 self.assertEqual(reports[0].stat().st_mode & 0o777, 0o600)
+                if diagnostics_enabled:
+                    self.assertIn("ssh_diagnostics", reports[0].read_text())
+                    diagnostic_button = next(element for element in container.descendants() if isinstance(element, ui.button)
+                                             and element.text == "Download SSH diagnostics")
+                    with patch.object(ui.download, "content") as download:
+                        self.click_callback(diagnostic_button)()
+                        download.assert_called_once_with(diagnostic_text, filename="telemetry-SERIAL1-ssh.txt")
                 switch_log = reports[0].parent / "switch-1.log"
                 self.assertTrue(switch_log.is_file())
                 self.assertTrue(any(isinstance(element, ui.code) and "Copy complete." in element.content

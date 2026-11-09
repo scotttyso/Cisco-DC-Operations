@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import ipaddress
+import io
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock
@@ -184,8 +185,10 @@ def replace_source(template: str, interface: str) -> str:
 
 
 class TelemetrySSH(NexusDashboardSSH):
-    def __init__(self, target: str, username: str, password: str, jump: dict | None, connect_timeout: int = 60):
-        super().__init__(target, username, password, jump, connect_timeout, switch_label="NX-OS switch")
+    def __init__(self, target: str, username: str, password: str, jump: dict | None, connect_timeout: int = 60,
+                 *, diagnostic_log: io.StringIO | None = None):
+        super().__init__(target, username, password, jump, connect_timeout, switch_label="NX-OS switch",
+                         diagnostic_log=diagnostic_log, nd_source_interface="bond0" if jump is not None else None)
 
     def discover(self, address: str, read_timeout: int = 90) -> str:
         family = "ipv6" if ":" in address else "ip"
@@ -237,6 +240,44 @@ class TelemetrySSH(NexusDashboardSSH):
         except Exception:
             self.session.child.close(force=True)
             raise
+
+
+@contextmanager
+def telemetry_connection(target: str, username: str, password: str, jump: dict | None,
+                         connect_timeout: int, read_timeout: int, diagnostics: dict | None) -> Iterator[TelemetrySSH]:
+    buffer = io.StringIO() if diagnostics is not None else None
+    connection = None
+    details = [
+        f"SSH target: {target}:22", f"SSH username: {username}",
+        f"Connection method: {'Nexus Dashboard rescue-user jump (source interface bond0)' if jump is not None else 'direct SSH'}",
+        f"Connect timeout: {connect_timeout}s | Command timeout: {read_timeout}s",
+    ]
+    try:
+        if buffer is None:
+            connection = TelemetrySSH(target, username, password, jump, connect_timeout)
+        else:
+            connection = TelemetrySSH(target, username, password, jump, connect_timeout, diagnostic_log=buffer)
+        yield connection
+    except Exception as error:
+        details.append(f"Session error: {type(error).__name__}: {error}")
+        raise
+    finally:
+        try:
+            if connection is not None:
+                connection.disconnect()
+        finally:
+            if buffer is not None and diagnostics is not None:
+                transcript = buffer.getvalue()
+                header = "\n".join(details)
+                for secret in (password, (jump or {}).get("password", "")):
+                    if secret:
+                        header = header.replace(secret, "[REDACTED]").replace(repr(secret)[1:-1], "[REDACTED]")
+                        transcript = transcript.replace(secret, "[REDACTED]").replace(repr(secret)[1:-1], "[REDACTED]")
+                text = (header + "\n\nReceived SSH transcript and connection stages:\n" + transcript
+                        + "\n\nReceived tail (repr; exposes CR/ANSI/control characters):\n"
+                        + repr(transcript[-2000:]))
+                diagnostics["session_log"] = text
+                buffer.close()
 
 
 def normalize_vrf(value, fabric: str) -> str:
@@ -291,7 +332,8 @@ class TelemetryPush:
         return normalize_vrf(response.get("telemetrySourceVrf"), fabric)
 
     def preview(self, selection: dict, password: str, jump: dict | None,
-                connect_timeout: int = 60, read_timeout: int = 90) -> list[dict]:
+                connect_timeout: int = 60, read_timeout: int = 90,
+                *, diagnostics: list[dict] | None = None) -> list[dict]:
         switches = nd_helpers()["load_switches"](self.client.request("GET", nd_helpers()["SWITCHES"]))
         inventory = [{"serial": switch.serial, "name": switch.name, "address": switch.address,
                       "fabric": switch.fabric} for switch in switches]
@@ -323,11 +365,13 @@ class TelemetryPush:
                     interface, origin = inventory_interface, "ND inventory sourceInterfaceName"
                 if not interface:
                     origin = "Discovered from ND management IP"
-                    connection = TelemetrySSH(switch["address"], selection["switches"]["username"], password, jump, connect_timeout)
-                    try:
+                    diagnostic = None
+                    if diagnostics is not None:
+                        diagnostic = {}
+                        diagnostics.append({**switch, "ssh_diagnostics": diagnostic})
+                    with telemetry_connection(switch["address"], selection["switches"]["username"], password,
+                                              jump, connect_timeout, read_timeout, diagnostic) as connection:
                         interface = connection.discover(switch["address"], read_timeout)
-                    finally:
-                        connection.disconnect()
                 template = replace_source(template, interface)
             plans.append({**switch, "vrf": vrf, "source_interface": interface, "source": origin,
                           "template": template, "state": "READY", "detail": ""})
@@ -336,7 +380,8 @@ class TelemetryPush:
 
 def push_plans(plans: list[dict], username: str, password: str, jump: dict | None,
                notify: Callable[[str], None], log_directory: Path | None = None,
-               workers: int = 1, connect_timeout: int = 20, read_timeout: int = 90) -> list[dict]:
+               workers: int = 1, connect_timeout: int = 20, read_timeout: int = 90,
+               *, ssh_diagnostics: bool = False) -> list[dict]:
     for label, value, maximum in (("Parallel switches", workers, 32),
                                   ("SSH connection timeout", connect_timeout, None),
                                   ("Per-command timeout", read_timeout, None)):
@@ -351,7 +396,7 @@ def push_plans(plans: list[dict], username: str, password: str, jump: dict | Non
     def redact(text: str) -> str:
         for secret in (password, jump["password"] if jump is not None else ""):
             if secret:
-                text = text.replace(secret, "[REDACTED]")
+                text = text.replace(secret, "[REDACTED]").replace(repr(secret)[1:-1], "[REDACTED]")
         return text
 
     def push_switch(index: int, skipped: bool = False) -> dict:
@@ -373,21 +418,26 @@ def push_plans(plans: list[dict], username: str, password: str, jump: dict | Non
             if skipped:
                 result.update(state="NOT_ATTEMPTED", detail="Stopped after a previous switch failed")
             else:
-                connection = None
-                route = "via Nexus Dashboard rescue-user" if jump is not None else "directly to switch"
+                diagnostic = {} if ssh_diagnostics else None
+                route = "via Nexus Dashboard rescue-user (source interface bond0)" if jump is not None else "directly to switch"
                 record(f"connecting {route}")
+                applying = False
                 try:
-                    connection = TelemetrySSH(plan["address"], username, password, jump, connect_timeout)
-                    connection.push(plan["template"], record, read_timeout)
+                    with telemetry_connection(plan["address"], username, password, jump,
+                                              connect_timeout, read_timeout, diagnostic) as connection:
+                        applying = True
+                        connection.push(plan["template"], record, read_timeout)
                     result.update(state="PUSHED", detail="CLI accepted configuration and confirmed startup-config save. "
                                   "Telemetry reception on ND has not been verified.")
                 except Exception as error:
-                    result.update(state="FAILED", detail="Configuration may be partially applied: " + redact(str(error)))
+                    detail = "Configuration may be partially applied: " if applying else "SSH connection failed; no telemetry configuration was sent: "
+                    result.update(state="FAILED", detail=detail + redact(str(error)))
                     with scheduling:
                         stopped.set()
                 finally:
-                    if connection:
-                        connection.disconnect()
+                    if diagnostic is not None:
+                        result["ssh_diagnostics"] = diagnostic
+                        record("SSH diagnostics (password-redacted):\n" + diagnostic["session_log"])
             record(f"{result['state']} - {result['detail']}")
         if result["state"] == "FAILED":
             notify("Stopped starting new switches after failure; in-progress switches will finish. "

@@ -22,29 +22,41 @@ def jump_helpers():
 
 class NexusDashboardSSH:
     def __init__(self, target: str, username: str, password: str, jump: dict | None, timeout: int,
-                 *, switch_label: str = "ACI switch", diagnostic_log: io.StringIO | None = None):
+                 *, switch_label: str = "ACI switch", diagnostic_log: io.StringIO | None = None,
+                 nd_source_interface: str | None = None):
         hosts = (target, jump.get("host")) if jump is not None else (target,)
         if not all(re.fullmatch(r"[A-Za-z0-9_.:-]+", host or "") for host in hosts):
             raise ValueError("Invalid switch or Nexus Dashboard SSH hostname")
         if jump is not None and not jump.get("password"):
             raise ValueError("Save the rescue-user password on the Nexus Dashboards tab")
+        if nd_source_interface is not None and not re.fullmatch(r"[A-Za-z0-9_.:-]+", nd_source_interface):
+            raise ValueError("Invalid Nexus Dashboard SSH source interface")
         helpers = jump_helpers()
         cfg = {"login_timeout": timeout, "nexus_dashboard": {}, "switches": {}}
         self.session = helpers["SwitchStager"](cfg, target, Path("."), dry_run=True, via_nd=jump is not None)
         if diagnostic_log is not None:
             self.session.log_fh = diagnostic_log
-        self.session.note = lambda message: None
+        def note(message: str) -> None:
+            if diagnostic_log is not None:
+                diagnostic_log.write(f"{message}\n")
+
+        self.session.note = note
         options = ["-o", "PreferredAuthentications=keyboard-interactive,password", "-o", "PubkeyAuthentication=no",
                    "-o", f"ConnectTimeout={int(timeout)}", "-o", "ConnectionAttempts=1"]
         try:
             if jump is not None:
+                note(f"Connecting to Nexus Dashboard {jump['host']} as rescue-user")
                 self.session._spawn(options + ["-l", "rescue-user", "--", jump["host"]])
                 self.session._authenticate(jump["password"], helpers["ND_GENERIC_PROMPT"], "Nexus Dashboard")
                 prompt = self.session._capture_prompt(helpers["ND_GENERIC_PROMPT"])
                 self.session.nd_prompt_re = re.escape(prompt) + r"\s*$"
+                note(f"Nexus Dashboard prompt (repr): {prompt!r}")
 
             def switch_login(extra_options=()):
-                arguments = [*options, *extra_options, "-l", username, "--", target]
+                binding = ["-B", nd_source_interface] if jump is not None and nd_source_interface else []
+                arguments = [*binding, *options, *extra_options, "-l", username, "--", target]
+                note(f"Switch SSH command: {shlex.join(['ssh', *arguments])}")
+                note(f"Waiting for {switch_label} login; prompt pattern: {helpers['SWITCH_GENERIC_PROMPT']!r}")
                 if jump is None:
                     self.session._spawn(arguments)
                 else:
@@ -57,6 +69,7 @@ class NexusDashboardSSH:
             except helpers["StageError"] as error:
                 if not helpers["LEGACY_ERR_RE"].search(str(error)):
                     raise
+                note(f"{error}; retrying with legacy SSH options")
                 if jump is None:
                     self.session.child.close(force=True)
                 else:
@@ -64,9 +77,11 @@ class NexusDashboardSSH:
                 switch_login(helpers["LEGACY_SSH_OPTIONS"])
             prompt = self.session._capture_prompt(helpers["SWITCH_GENERIC_PROMPT"])
             self.session.sw_prompt_re = re.escape(prompt) + r"\s*$"
+            note(f"Switch prompt (repr): {prompt!r}")
             self.session.cmd("terminal length 0", timeout=timeout)
             self.session.cmd("terminal width 511", timeout=timeout)
         except Exception as error:
+            note(f"Connection error: {type(error).__name__}: {error}")
             self.disconnect()
             if re.search(r"password rejected|permission denied|authentication failed", str(error), re.IGNORECASE):
                 label = f"Nexus Dashboard or {switch_label}" if jump is not None else switch_label

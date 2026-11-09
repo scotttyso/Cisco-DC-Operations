@@ -44,6 +44,7 @@ class JumpConnectionTests(unittest.TestCase):
         self.assertIn("rescue-user", session._spawn.call_args.args[0])
         command = session.child.sendline.call_args.args[0]
         self.assertIn("leaf101.corp.test", command)
+        self.assertNotIn("-B", command)
         self.assertNotIn("switch-secret", command)
         self.assertNotIn("rescue-secret", command)
         self.assertEqual(session._authenticate.call_args_list[0].args[0], "rescue-secret")

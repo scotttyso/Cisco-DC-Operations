@@ -1774,6 +1774,7 @@ def telemetry_push_panel():
                 raise ValueError(f"{field._props['label']} must be a positive whole number"
                                  + (f" between 1 and {maximum}" if maximum else ""))
             settings[key] = int(value)
+        settings["ssh_diagnostics"] = bool(ssh_diagnostics.value)
         return settings
 
     def switch_values(selection, save=False):
@@ -1843,12 +1844,29 @@ def telemetry_push_panel():
                               on_click=lambda path=path: download_switch_log(path)).props("outline")
                     ui.code(path.read_text(encoding="utf-8"), language="text").classes("w-full")
 
+    def render_ssh_diagnostics(results):
+        ssh_logs.clear()
+        with ssh_logs:
+            for result in results:
+                text = result.get("ssh_diagnostics", {}).get("session_log", "")
+                if not text:
+                    continue
+                with ui.expansion(f"SSH diagnostics | {result['name']} | {result['serial']}").classes("w-full"):
+                    ui.button("Download SSH diagnostics", icon="download",
+                              on_click=lambda text=text, serial=result["serial"]: download_ssh_diagnostics(text, serial)).props("outline")
+                    ui.code(text[:60000], language="text").classes("w-full")
+
+    def download_ssh_diagnostics(text, serial):
+        owner()
+        ui.download.content(text, filename=f"telemetry-{serial}-ssh.txt")
+
     async def preview():
         if state["busy"]:
             return
         values = {}
         api_values = {}
         jump = {}
+        diagnostics = []
         busy(True)
         try:
             owner()
@@ -1856,20 +1874,31 @@ def telemetry_push_panel():
             selection = telemetry_selection(config.value or "")
             profile = profile_values()
             settings = push_settings()
+            diagnostic_root = output_directory() / "telemetry" if settings["ssh_diagnostics"] else None
             values = switch_values(selection)
             api_values = saved_credentials("dashboard", profile["id"], "Nexus Dashboards")
             connect_directly = bool(direct.value)
             jump = {} if connect_directly else ssh_jump(profile["id"])
             log.clear()
+            ssh_logs.clear()
             status.text = "Fetching telemetry and discovering inband interfaces..."
 
             def work():
                 service = TelemetryPush(profile, api_values)
                 try:
                     return service.preview(selection, values["password"], jump or None,
-                                           settings["connect_timeout"], settings["read_timeout"])
+                                           settings["connect_timeout"], settings["read_timeout"],
+                                           **({"diagnostics": diagnostics} if settings["ssh_diagnostics"] else {}))
                 finally:
-                    service.close()
+                    try:
+                        if diagnostics and diagnostic_root is not None:
+                            directory = diagnostic_root / uuid4().hex
+                            directory.mkdir(parents=True, mode=0o700)
+                            path = directory / "preview-ssh.json"
+                            path.touch(mode=0o600, exist_ok=False)
+                            path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+                    finally:
+                        service.close()
 
             plans = await run.io_bound(work)
             owner()
@@ -1882,6 +1911,8 @@ def telemetry_push_panel():
             status.text = "Preview failed; no telemetry was pushed"
             password.value = ""
         finally:
+            if diagnostics:
+                render_ssh_diagnostics(diagnostics)
             values.clear()
             api_values.clear()
             jump.clear()
@@ -1927,11 +1958,13 @@ def telemetry_push_panel():
             state["plans"] = []
             state["report"] = None
             switch_logs.clear()
+            ssh_logs.clear()
             log.clear()
             status.text = "Pushing telemetry and saving startup-config..."
             results = await run.io_bound(push_plans, plans, values["username"], values["password"],
                                          jump or None, messages.put, directory, settings["workers"],
-                                         settings["connect_timeout"], settings["read_timeout"])
+                                         settings["connect_timeout"], settings["read_timeout"],
+                                         **({"ssh_diagnostics": True} if settings["ssh_diagnostics"] else {}))
             report.write_text(json.dumps(results, indent=2), encoding="utf-8")
             report.chmod(0o600)
             state["report"] = report
@@ -1939,6 +1972,7 @@ def telemetry_push_panel():
             table.rows = results
             table.update()
             render_switch_logs(directory, results)
+            render_ssh_diagnostics(results)
             status.text = " | ".join(f"{sum(result['state'] == value for result in results)} {value}"
                                      for value in sorted({result["state"] for result in results}))
             status.text += " | Preview again before another push"
@@ -1985,6 +2019,11 @@ def telemetry_push_panel():
             ui.label("On failure, stop starting new switches and let in-progress switches finish. "
                      "Use 1 parallel switch for sequential pushes. SSH timeouts also apply to preview discovery; "
                      "startup-config saves allow at least 300 seconds.").classes("muted")
+            ssh_diagnostics = ui.checkbox("Record SSH diagnostics (password-redacted)", value=False)
+            ui.label("Records ND and switch login stages, received SSH output, and prompt details for preview discovery "
+                     "and push, including failed logins. Download diagnostics below after running. "
+                     "Both passwords are redacted; output can still contain device and network details.").classes("muted")
+        ui.label("ND-to-switch SSH uses source interface bond0 (ssh -B bond0); direct SSH is unchanged.").classes("muted")
         config = ui.textarea("Telemetry YAML configuration", value=saved_config.get("yaml", TELEMETRY_EXAMPLE)).props(
             "outlined").classes("w-full code-input")
         save_yaml_button = ui.button("Save YAML", icon="save", on_click=save_yaml).props("outline")
@@ -2021,8 +2060,9 @@ def telemetry_push_panel():
         preview_content = ui.column().classes("w-full")
         log = ui.log(max_lines=2000).classes("job-log")
         switch_logs = ui.column().classes("w-full")
+        ssh_logs = ui.column().classes("w-full")
         ui.timer(0.2, drain_log)
-    controls = (dashboard, direct, workers, connect_timeout, read_timeout, config, save_yaml_button, password, use_saved, remember,
+    controls = (dashboard, direct, workers, connect_timeout, read_timeout, ssh_diagnostics, config, save_yaml_button, password, use_saved, remember,
                 save_credentials_button, forget_button, preview_button, push_button)
     dashboard.on_value_change(dashboard_changed)
     direct.on_value_change(invalidate)
