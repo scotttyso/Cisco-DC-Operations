@@ -173,7 +173,7 @@ class TelemetryPreviewTests(unittest.TestCase):
         ssh.assert_not_called()
         selection = {**SELECTION, "source_interfaces": {"leaf1": "Vlan72"}}
         plans = self.service(switch_vrf="default", switch_interface="vlan64").preview(selection, "secret", None)
-        self.assertEqual((plans[0]["source_interface"], plans[0]["source"]), ("Vlan72", "YAML override"))
+        self.assertEqual((plans[0]["source_interface"], plans[0]["source"]), ("Vlan72", "User override"))
 
     @patch("nd_telemetry.TelemetrySSH")
     def test_switch_inventory_source_vrf_wins_over_fabric(self, ssh):
@@ -726,7 +726,7 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         import automation_ui
         from nicegui import ui
 
-        profile = {"id": "nd1", "name": "ND", "address": "nd.example"}
+        profile = {"id": "nd1", "name": "ND", "address": "nd.example", "verify_tls": True}
         store = MagicMock()
         store.credentials.return_value = {}
         store.dashboards.return_value = [profile]
@@ -740,18 +740,21 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 patch.object(automation_ui, "STORE", store, create=True), \
                 patch.object(automation_ui, "owner", return_value="tester"), \
                 patch.object(automation_ui, "TelemetryPush") as service, \
-                patch.object(automation_ui, "saved_credentials", return_value={"password": "api-secret"}), \
+                patch.object(automation_ui, "InterfaceDescriptions") as inventory, \
+                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "api-secret", "domain": "local"}), \
                 patch.object(automation_ui, "ssh_jump", return_value={"host": "nd.example", "password": "rescue-secret"}), \
                 patch.object(automation_ui, "output_directory", return_value=Path(temporary)), \
                 patch.object(ui, "notify"), \
                 patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
                              side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)):
             service.return_value.preview.side_effect = fail
-            elements, buttons, config, password = self.telemetry_form()
+            inventory.return_value.switches.return_value = INVENTORY
+            elements, buttons, username, password = self.telemetry_form()
             dashboard = next(element for element in elements if isinstance(element, ui.select)
                              and element._props.get("label") == "Nexus Dashboard appliance")
             dashboard.value = "nd1"
-            config.value = "switches:\n  username: netops\n  hosts: [leaf1]\n"
+            await self.select_switches(elements, buttons)
+            username.value = "netops"
             password.value = "switch-secret"
             checkbox = next(element for element in elements if isinstance(element, ui.checkbox)
                             and element.text == "Record SSH diagnostics (password-redacted)")
@@ -778,16 +781,22 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
 
         store = MagicMock()
         store.credentials.return_value = {}
-        store.dashboards.return_value = [{"id": "nd1", "name": "ND", "address": "nd.example"}]
+        store.dashboards.return_value = [{"id": "nd1", "name": "ND", "address": "nd.example", "verify_tls": True}]
         with patch.object(automation_ui, "STORE", store, create=True), \
                 patch.object(automation_ui, "owner", return_value="tester"), \
                 patch.object(automation_ui, "TelemetryPush") as service, \
+                patch.object(automation_ui, "InterfaceDescriptions") as inventory, \
+                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "secret", "domain": "local"}), \
+                patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
+                             side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)), \
                 patch.object(ui, "notify") as notify:
-            elements, buttons, config, password = self.telemetry_form()
+            inventory.return_value.switches.return_value = INVENTORY
+            elements, buttons, username, password = self.telemetry_form()
             dashboard = next(element for element in elements if isinstance(element, ui.select)
                              and element._props.get("label") == "Nexus Dashboard appliance")
             dashboard.value = "nd1"
-            config.value = "switches:\n  username: netops\n  hosts: [leaf1]\n"
+            await self.select_switches(elements, buttons)
+            username.value = "netops"
             numbers = {element._props.get("label"): element for element in elements if isinstance(element, ui.number)}
             for label, value in (("Parallel switches", 0), ("Parallel switches", 33), ("Parallel switches", 1.5),
                                  ("SSH connection timeout (seconds)", None), ("Per-command timeout (seconds)", 0)):
@@ -813,15 +822,116 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
             automation_ui.telemetry_push_panel()
         elements = list(container.descendants())
         buttons = {element.text: element for element in elements if isinstance(element, ui.button)}
-        config = next(element for element in elements if isinstance(element, ui.textarea))
+        username = next(element for element in elements if isinstance(element, ui.input)
+                        and element._props.get("label") == "Switch username")
         password = next(element for element in elements if isinstance(element, ui.input)
-                        and element._props.get("label") == "Automation password")
-        return elements, buttons, config, password
+                        and element._props.get("label") == "Switch password")
+        return elements, buttons, username, password
+
+    async def select_switches(self, elements, buttons, count=1):
+        from nicegui import ui
+
+        await self.click_callback(buttons["Connect dashboard"])()
+        fabric = next(element for element in elements if isinstance(element, ui.select)
+                      and element._props.get("label") == "Fabric")
+        fabric.value = "Fabric / A"
+        table = next(element for element in elements if isinstance(element, ui.table)
+                     and element._props.get("selection") == "multiple")
+        table.selected = table.rows[:count]
+        table._selection_handlers[0]()
+        return fabric, table
 
     @staticmethod
     def click_callback(button):
         listener = next(listener for listener in button._event_listeners.values() if listener.type == "click")
         return inspect.getclosurevars(listener.handler).nonlocals["callback"]
+
+    async def test_inventory_selection_overrides_and_legacy_save_load(self):
+        import automation_ui
+        from nicegui import ui
+
+        profile = {"id": "nd1", "name": "ND", "address": "nd.example", "verify_tls": True}
+        switches = INVENTORY + [{**INVENTORY[1], "serial": "SERIAL3", "fabric": "Other"}]
+        store = MagicMock()
+        store.dashboards.return_value = [profile]
+        legacy = "switches:\n  username: netops\n  hosts: [leaf1]\nsource_interfaces:\n  leaf1: Vlan72\n"
+        store.credentials.side_effect = lambda _, scope: {"yaml": legacy} if scope == "nd-telemetry-settings" else {}
+        plans = [{**INVENTORY[0], "template": TEMPLATE}]
+        with patch.object(automation_ui, "STORE", store, create=True), \
+                patch.object(automation_ui, "owner", return_value="tester"), \
+                patch.object(automation_ui, "InterfaceDescriptions") as inventory, \
+                patch.object(automation_ui, "TelemetryPush") as service, \
+                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "secret", "domain": "local"}), \
+                patch.object(automation_ui, "ssh_jump", return_value={"password": "rescue"}), \
+                patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
+                             side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)), \
+                patch.object(ui, "notify") as notify:
+            inventory.return_value.switches.return_value = switches
+            service.return_value.preview.return_value = plans
+            elements, buttons, username, password = self.telemetry_form()
+            dashboard = next(element for element in elements if isinstance(element, ui.select)
+                             and element._props.get("label") == "Nexus Dashboard appliance")
+            dashboard.value = "nd1"
+            password.value = "switch-secret"
+            await self.click_callback(buttons["Preview telemetry"])()
+            self.assertIn("Connect", notify.call_args.args[0])
+            fabric, table = await self.select_switches(elements, buttons)
+            self.assertEqual(set(fabric.options), {"Fabric / A", "Other"})
+            self.assertEqual([row["serial"] for row in table.rows], ["SERIAL1", "SERIAL2"])
+            inventory.return_value.close.assert_called_once()
+            self.click_callback(buttons["Load saved selection"])()
+            self.assertEqual(username.value, "netops")
+            self.assertEqual([row["serial"] for row in table.selected], ["SERIAL1"])
+            override = next(element for element in table.client.elements.values() if isinstance(element, ui.input)
+                            and element._props.get("label") == "leaf1 | SERIAL1 - optional source interface")
+            self.assertEqual(override.value, "Vlan72")
+            override.value = "Loopback0"
+            self.click_callback(buttons["Save selection"])()
+            saved = telemetry_selection(store.save_credentials.call_args.args[2]["yaml"])
+            self.assertEqual(saved, {"switches": {"username": "netops", "hosts": ["SERIAL1"]},
+                                     "source_interfaces": {"SERIAL1": "Loopback0"}})
+            password.value = "switch-secret"
+            await self.click_callback(buttons["Preview telemetry"])()
+            self.assertTrue(service.return_value.preview.called, notify.call_args)
+            self.assertEqual(service.return_value.preview.call_args.args[0], saved)
+            self.assertTrue(buttons["Push telemetry"].enabled)
+            override.value = "Vlan73"
+            self.assertFalse(buttons["Push telemetry"].enabled)
+            await self.click_callback(buttons["Preview telemetry"])()
+            self.assertTrue(buttons["Push telemetry"].enabled)
+            table.selected = table.rows[:2]
+            table._selection_handlers[0]()
+            self.assertFalse(buttons["Push telemetry"].enabled)
+            fabric.value = "Other"
+            self.assertEqual([row["serial"] for row in table.rows], ["SERIAL3"])
+            self.assertEqual(table.selected, [])
+            dashboard.value = None
+            self.assertEqual(table.rows, [])
+            self.assertEqual(fabric.options, [])
+
+    async def test_connection_failure_clears_inventory_and_closes_session(self):
+        import automation_ui
+        from nicegui import ui
+
+        store = MagicMock()
+        store.credentials.return_value = {}
+        store.dashboards.return_value = [{"id": "nd1", "name": "ND", "address": "nd.example", "verify_tls": True}]
+        with patch.object(automation_ui, "STORE", store, create=True), \
+                patch.object(automation_ui, "owner", return_value="tester"), \
+                patch.object(automation_ui, "InterfaceDescriptions") as inventory, \
+                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "secret", "domain": "local"}), \
+                patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
+                             side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)), \
+                patch.object(ui, "notify") as notify:
+            inventory.return_value.switches.side_effect = RuntimeError("ND unavailable")
+            elements, buttons, _, _ = self.telemetry_form()
+            dashboard = next(element for element in elements if isinstance(element, ui.select)
+                             and element._props.get("label") == "Nexus Dashboard appliance")
+            dashboard.value = "nd1"
+            await self.click_callback(buttons["Connect dashboard"])()
+            inventory.return_value.close.assert_called_once()
+            self.assertIn("ND unavailable", notify.call_args.args[0])
+            self.assertFalse(buttons["Push telemetry"].enabled)
 
     async def test_explicit_saves_survive_reopening_and_are_private_to_account(self):
         import automation_ui
@@ -838,11 +948,10 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                     patch.object(automation_ui, "owner", return_value="tester") as owner, \
                     patch.object(automation_ui, "TelemetryPush") as service, \
                     patch.object(ui, "notify") as notify:
-                elements, buttons, config, password = self.telemetry_form()
-                config.value = text
+                elements, buttons, username, password = self.telemetry_form()
+                username.value = "switch-admin"
                 password.value = "switch-secret"
-                self.click_callback(buttons["Save YAML"])()
-                self.assertEqual(store.credentials("tester", "nd-telemetry"), {})
+                store.save_credentials("tester", "nd-telemetry-settings", {"yaml": text})
                 self.click_callback(buttons["Save switch credentials"])()
                 self.assertEqual(store.credentials("tester", "nd-telemetry"),
                                  {"username": "switch-admin", "password": "switch-secret"})
@@ -852,8 +961,9 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
 
                 reopened = ProfileStore(directory / "data", directory / "vault.key")
                 with patch.object(automation_ui, "STORE", reopened):
-                    elements, buttons, config, password = self.telemetry_form()
-                    self.assertEqual(config.value, text)
+                    elements, buttons, username, password = self.telemetry_form()
+                    self.assertEqual(username.value, "switch-admin")
+                    self.assertEqual(reopened.credentials("tester", "nd-telemetry-settings")["yaml"], text)
                     self.assertEqual(password.value, "")
                     saved = next(element for element in elements if isinstance(element, ui.checkbox)
                                  and element.text == "Use saved switch credentials")
@@ -861,11 +971,11 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(any("switch-admin" in getattr(element, "text", "") for element in elements))
                     self.assertFalse(buttons["Push telemetry"].enabled)
                     owner.return_value = "other"
-                    elements, buttons, config, password = self.telemetry_form()
-                    self.assertEqual(config.value, automation_ui.TELEMETRY_EXAMPLE)
+                    elements, buttons, username, password = self.telemetry_form()
+                    self.assertEqual(username.value, "")
                     self.assertEqual(reopened.credentials("other", "nd-telemetry"), {})
 
-    async def test_saves_reject_invalid_yaml_and_mismatched_saved_username(self):
+    async def test_saves_reject_invalid_and_mismatched_saved_username(self):
         import automation_ui
         from nicegui import ui
 
@@ -875,12 +985,12 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         with patch.object(automation_ui, "STORE", store, create=True), \
                 patch.object(automation_ui, "owner", return_value="tester"), \
                 patch.object(ui, "notify") as notify:
-            elements, buttons, config, password = self.telemetry_form()
-            config.value = "switches:\n  username: new-user\n  hosts: [leaf1]\npassword: forbidden\n"
-            self.click_callback(buttons["Save YAML"])()
+            elements, buttons, username, password = self.telemetry_form()
+            username.value = "invalid user"
+            self.click_callback(buttons["Save switch credentials"])()
             store.save_credentials.assert_not_called()
             self.assertEqual(notify.call_args.kwargs["type"], "negative")
-            config.value = "switches:\n  username: new-user\n  hosts: [leaf1]\n"
+            username.value = "new-user"
             self.click_callback(buttons["Save switch credentials"])()
             store.save_credentials.assert_not_called()
             self.assertEqual(notify.call_args.kwargs["type"], "negative")
@@ -929,8 +1039,9 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
             "nd-telemetry": {"username": username, "password": "switch-secret"},
             "nd-telemetry-settings": {"yaml": text},
         }.get(scope, {}) if saved else {})
-        plans = [{**INVENTORY[0], "vrf": "default", "source_interface": "Vlan72",
-                  "source": "Discovered", "template": TEMPLATE, "state": "READY", "detail": ""}]
+        plans = [{**switch, "vrf": "default", "source_interface": "Vlan72",
+                  "source": "Discovered", "template": TEMPLATE, "state": "READY", "detail": ""}
+                 for switch in (INVENTORY if diagnostics_enabled else INVENTORY[:1])]
         preview_routes = []
         push_routes = []
 
@@ -948,43 +1059,47 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
         def capture_push(plans, username, password, jump, notify, directory, workers, connect_timeout, read_timeout, **kwargs):
             self.assertEqual((workers, connect_timeout, read_timeout), (4, 35, 150))
             push_routes.append(None if jump is None else jump.copy())
-            path = directory / "switch-1.log"
-            path.touch(mode=0o600)
-            path.write_text("> feature telemetry\n> copy running-config startup-config\nCopy complete.\n")
-            result = {**INVENTORY[0], "state": "PUSHED", "log_file": path.name}
-            if diagnostics_enabled:
-                self.assertEqual(kwargs, {"ssh_diagnostics": True})
-                result["ssh_diagnostics"] = {"session_log": diagnostic_text}
-            else:
-                self.assertEqual(kwargs, {})
-            return [result]
+            self.assertEqual(kwargs, {"ssh_diagnostics": True} if diagnostics_enabled else {})
+            results = []
+            for index, plan in enumerate(plans, 1):
+                path = directory / f"switch-{index}.log"
+                path.touch(mode=0o600)
+                path.write_text("> feature telemetry\n> copy running-config startup-config\nCopy complete.\n")
+                result = {**plan, "state": "PUSHED", "log_file": path.name}
+                if diagnostics_enabled:
+                    result["ssh_diagnostics"] = {"session_log": diagnostic_text}
+                results.append(result)
+            return results
 
         with tempfile.TemporaryDirectory() as temporary, \
                 patch.object(automation_ui, "STORE", store, create=True), \
                 patch.object(automation_ui, "owner", return_value="tester"), \
                 patch.object(automation_ui, "TelemetryPush") as service, \
+                patch.object(automation_ui, "InterfaceDescriptions") as inventory, \
                 patch.object(automation_ui, "push_plans", side_effect=capture_push) as push, \
                 patch.object(automation_ui, "confirm", new_callable=AsyncMock, return_value=True) as confirm, \
-                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "api-secret"}), \
+                patch.object(automation_ui, "saved_credentials", return_value={"username": "api", "password": "api-secret", "domain": "local"}), \
                 patch.object(automation_ui, "ssh_jump",
                              side_effect=lambda _: {"host": "nd.example", "password": "rescue-secret"}) as jump, \
                 patch.object(automation_ui, "output_directory", return_value=Path(temporary)), \
                 patch.object(automation_ui.run, "io_bound", new_callable=AsyncMock,
                              side_effect=lambda function, *args, **kwargs: function(*args, **kwargs)):
             service.return_value.preview.side_effect = capture_preview
+            inventory.return_value.switches.return_value = INVENTORY
             client = Client(page("/telemetry-test"))
             self.addCleanup(client.delete)
             with client, ui.column() as container:
                 dashboard, changed = automation_ui.telemetry_push_panel()
                 dashboard.value = "nd1"
                 elements = list(container.descendants())
-                yaml_field = next(element for element in elements if isinstance(element, ui.textarea))
+                username_field = next(element for element in elements if isinstance(element, ui.input)
+                                      and element._props.get("label") == "Switch username")
                 password = next(element for element in elements if isinstance(element, ui.input)
-                                and element._props.get("label") == "Automation password")
-                direct = next(element for element in elements if isinstance(element, ui.switch)
-                              and element.text == "Connect directly to switches")
-                self.assertFalse(direct.value)
-                direct.value = direct_connection
+                                and element._props.get("label") == "Switch password")
+                ssh_route = next(element for element in elements if isinstance(element, ui.toggle)
+                                 and element.options == {"direct": "Direct SSH", "nd": "SSH via Nexus Dashboard"})
+                self.assertEqual(ssh_route.value, "nd")
+                ssh_route.value = "direct" if direct_connection else "nd"
                 buttons = {element.text: element for element in elements if isinstance(element, ui.button)}
                 numbers = {element._props.get("label"): element for element in elements if isinstance(element, ui.number)}
                 self.assertEqual(numbers["Parallel switches"].value, 20)
@@ -996,11 +1111,15 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                                 and element.text == "Record SSH diagnostics (password-redacted)")
                 self.assertFalse(checkbox.value)
                 checkbox.value = diagnostics_enabled
+                await self.select_switches(elements, buttons, len(plans))
                 if saved:
-                    self.assertEqual(yaml_field.value, text)
+                    self.click_callback(buttons["Load saved selection"])()
+                    if diagnostics_enabled:
+                        self.fail("Saved diagnostics test requires multiple saved hosts")
+                    self.assertEqual(username_field.value, username)
                     self.assertEqual(password.value, "")
                 else:
-                    yaml_field.value = text
+                    username_field.value = username
                     password.value = "switch-secret"
                 remember = next(element for element in elements if isinstance(element, ui.switch)
                                 and element.text == "Remember encrypted switch credentials")
@@ -1046,6 +1165,16 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(reports), 1)
                 self.assertNotIn("secret", reports[0].read_text())
                 self.assertEqual(reports[0].stat().st_mode & 0o777, 0o600)
+                log_expansions = [element for element in container.descendants() if isinstance(element, ui.expansion)
+                                  and any(element.text.startswith(f"{switch['name']} | {switch['serial']} |")
+                                          for switch in INVENTORY)]
+                expected_labels = []
+                for plan in plans:
+                    expected_labels.append(f"{plan['name']} | {plan['serial']} | PUSHED")
+                    if diagnostics_enabled:
+                        expected_labels.append(f"{plan['name']} | {plan['serial']} | SSH diagnostics")
+                self.assertEqual([element.text for element in log_expansions], expected_labels)
+                self.assertTrue(all(element.parent_slot is log_expansions[0].parent_slot for element in log_expansions))
                 if diagnostics_enabled:
                     self.assertIn("ssh_diagnostics", reports[0].read_text())
                     diagnostic_button = next(element for element in container.descendants() if isinstance(element, ui.button)
@@ -1066,16 +1195,17 @@ class TelemetryUITests(unittest.IsolatedAsyncioTestCase):
                     password.value = "switch-secret"
                 await preview()
                 self.assertTrue(buttons["Push telemetry"].enabled)
-                direct.value = not direct_connection
+                ssh_route.value = "nd" if direct_connection else "direct"
                 self.assertFalse(buttons["Push telemetry"].enabled)
-                direct.value = direct_connection
+                ssh_route.value = "direct" if direct_connection else "nd"
                 await preview()
                 changed()
                 self.assertFalse(buttons["Push telemetry"].enabled)
+                await self.select_switches(elements, buttons, len(plans))
                 await preview()
 
                 def change_route_during_confirmation(*args):
-                    direct.value = not direct_connection
+                    ssh_route.value = "nd" if direct_connection else "direct"
                     return True
 
                 confirm.side_effect = change_route_during_confirmation

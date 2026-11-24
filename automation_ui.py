@@ -36,7 +36,7 @@ from aci_ifstatus_common import (DIAGNOSTIC_COMMANDS, ROLE_COMMANDS, CaptureCanc
 from oidc_auth import OIDCLoginError, create_oidc_client, role_from_claims
 from nxos_jobs import NXJob, nd_switch_selection
 from nd_interfaces import InterfaceDescriptions, filter_interface_rows, nd_helpers, validate_description
-from nd_telemetry import TELEMETRY_EXAMPLE, TelemetryPush, push_plans, telemetry_selection
+from nd_telemetry import TelemetryPush, push_plans, selected_switches, telemetry_selection, validate_switch_username
 from interface_description_table import InterfaceDescriptionTable
 from release_updates import installed_version, install_instructions, latest_release
 from secure_profiles import ProfileStore, normalize_apic, profile_credential_values
@@ -1734,11 +1734,11 @@ def interface_description_panel():
 
 
 def telemetry_push_panel():
-    state = {"plans": [], "profile": None, "selection": None, "direct": None, "busy": False, "report": None}
+    state = {"plans": [], "profile": None, "selection": None, "direct": None, "busy": False, "report": None,
+             "connected_profile": None, "switches": [], "overrides": {}}
     messages = queue.Queue()
     account = owner()
     saved_switch = STORE.credentials(account, "nd-telemetry")
-    saved_config = STORE.credentials(account, "nd-telemetry-settings")
 
     def drain_log():
         while not messages.empty():
@@ -1755,13 +1755,102 @@ def telemetry_push_panel():
     def dashboard_changed():
         owner()
         if not state["busy"]:
+            state.update(connected_profile=None, switches=[], overrides={})
+            fabric.set_options([], value=None)
+            switch_table.rows = []
+            switch_table.selected = []
+            switch_table.update()
+            override_fields.clear()
             invalidate()
+            status.text = "Not connected"
 
     def profile_values():
         profile = next((entry for entry in STORE.dashboards() if entry["id"] == dashboard.value), None)
         if profile is None:
             raise ValueError("Select a Nexus Dashboard appliance")
         return profile
+
+    def active_profile():
+        profile = profile_values()
+        if profile != state["connected_profile"]:
+            raise ValueError("Connect to the selected Nexus Dashboard before continuing")
+        return profile
+
+    def selection_values():
+        active_profile()
+        available = {entry["serial"]: entry for entry in state["switches"] if entry["fabric"] == fabric.value}
+        serials = [row.get("serial") for row in switch_table.selected]
+        if not fabric.value or not serials or any(serial not in available for serial in serials):
+            raise ValueError("Select a fabric and at least one switch")
+        overrides = {serial: state["overrides"][serial].strip() for serial in serials
+                     if state["overrides"].get(serial, "").strip()}
+        return telemetry_selection(yaml.safe_dump({"switches": {"username": username.value or "", "hosts": serials},
+                                                   "source_interfaces": overrides}))
+
+    def selection_changed():
+        invalidate()
+        override_fields.clear()
+        with override_fields:
+            for row in switch_table.selected:
+                serial = row["serial"]
+                field = ui.input(f"{row['name']} | {serial} - optional source interface",
+                                 value=state["overrides"].get(serial, "")).props("outlined dense").classes("w-full")
+
+                def changed(event, serial=serial):
+                    state["overrides"][serial] = event.value or ""
+                    invalidate()
+
+                field.on_value_change(changed)
+                field.set_enabled(not state["busy"])
+
+    def fabric_changed():
+        state["overrides"] = {}
+        switch_table.selected = []
+        switch_table.rows = [entry for entry in state["switches"] if entry["fabric"] == fabric.value]
+        switch_table.update()
+        selection_changed()
+
+    async def connect():
+        if state["busy"]:
+            return
+        values = {}
+        busy(True)
+        try:
+            owner()
+            state.update(connected_profile=None, switches=[], overrides={})
+            fabric.set_options([], value=None)
+            switch_table.selected = []
+            switch_table.rows = []
+            switch_table.update()
+            override_fields.clear()
+            invalidate()
+            profile = profile_values()
+            values = saved_credentials("dashboard", profile["id"], "Nexus Dashboards")
+            status.text = "Connecting and discovering fabrics/switches..."
+
+            def work():
+                service = InterfaceDescriptions("https://" + profile["address"], values["username"], values["password"],
+                                                bool(profile["verify_tls"]), values["domain"])
+                try:
+                    return service.switches()
+                finally:
+                    service.close()
+
+            switches = await run.io_bound(work)
+            owner()
+            if not switches:
+                raise ValueError("ND returned no fabric switches")
+            if profile_values() != profile:
+                raise ValueError("Dashboard changed while connecting; connect again")
+            state.update(connected_profile=profile, switches=switches)
+            fabric.set_options(sorted({entry["fabric"] for entry in switches}), value=None)
+            status.text = f"Connected to {profile['name']} | {len(switches)} switches"
+        except Exception as error:
+            notify_error(error, values)
+            status.text = "Connection did not complete"
+        finally:
+            values.clear()
+            busy(False)
 
     def push_settings():
         settings = {}
@@ -1782,32 +1871,54 @@ def telemetry_push_panel():
         values = STORE.credentials(owner(), "nd-telemetry") if use_saved.value else {}
         entered = password.value or ""
         if not entered and values and values.get("username") != username:
-            raise ValueError(f"Saved switch credentials are for {values.get('username')}, but the YAML uses {username}. "
-                             "Restore the matching YAML username or enter and save its automation password.")
+            raise ValueError(f"Saved switch credentials are for {values.get('username')}, but the switch username is {username}. "
+                             "Enter the matching username or enter and save its switch password.")
         secret = entered or values.get("password", "")
         if not secret:
-            raise ValueError("Enter a switch automation password or enable saved switch credentials. "
+            raise ValueError("Enter a switch password or enable saved switch credentials. "
                              "Use Save switch credentials to save without running a preview.")
         if save or remember.value:
             STORE.save_credentials(owner(), "nd-telemetry", {"username": username, "password": secret})
             use_saved.value = True
-            credential_status.text = f"Encrypted switch credentials saved for {username}; the YAML username must match"
+            credential_status.text = f"Encrypted switch credentials saved for {username}; the switch username must match"
         return {"username": username, "password": secret}
 
     def save_switch_credentials():
         try:
-            switch_values(telemetry_selection(config.value or ""), save=True)
+            switch_values({"switches": {"username": validate_switch_username(username.value or "")}}, save=True)
             password.value = ""
             ui.notify("Encrypted switch credentials saved", type="positive")
         except (ValueError, InvalidToken) as error:
             notify_error(error, {"password": password.value or ""})
 
-    def save_yaml():
+    def save_selection():
         try:
-            text = config.value or ""
-            telemetry_selection(text)
-            STORE.save_credentials(owner(), "nd-telemetry-settings", {"yaml": text})
-            ui.notify("Telemetry YAML saved for your account", type="positive")
+            selection = selection_values()
+            STORE.save_credentials(owner(), "nd-telemetry-settings", {"yaml": yaml.safe_dump(selection)})
+            ui.notify("Telemetry selection saved for your account", type="positive")
+        except (ValueError, InvalidToken) as error:
+            notify_error(error)
+
+    def load_selection():
+        try:
+            active_profile()
+            text = STORE.credentials(owner(), "nd-telemetry-settings").get("yaml")
+            if not text:
+                raise ValueError("No saved telemetry selection")
+            selection = telemetry_selection(text)
+            switches = selected_switches(state["switches"], selection["switches"]["hosts"])
+            fabrics = {entry["fabric"] for entry in switches}
+            if len(fabrics) != 1:
+                raise ValueError("Saved selection spans multiple fabrics; select switches in one fabric instead")
+            fabric.value = next(iter(fabrics))
+            switch_table.selected = [{key: entry[key] for key in ("serial", "name", "address", "fabric")}
+                                     for entry in switches]
+            state["overrides"] = {entry["serial"]: selection["source_interfaces"][entry["selected_as"]]
+                                  for entry in switches if entry["selected_as"] in selection["source_interfaces"]}
+            username.value = selection["switches"]["username"]
+            selection_changed()
+            switch_table.update()
+            ui.notify("Saved telemetry selection loaded; review switches before previewing", type="positive")
         except (ValueError, InvalidToken) as error:
             notify_error(error)
 
@@ -1815,6 +1926,12 @@ def telemetry_push_panel():
         state["busy"] = value
         for control in controls:
             control.set_enabled(not value)
+        if value:
+            switch_table.classes(add="pointer-events-none opacity-50")
+        else:
+            switch_table.classes(remove="pointer-events-none opacity-50")
+        for field in override_fields.descendants():
+            field.set_enabled(not value)
         push_button.set_enabled(not value and bool(state["plans"]))
 
     def render_plans(plans):
@@ -1843,18 +1960,22 @@ def telemetry_push_panel():
                     ui.button("Download switch log", icon="download",
                               on_click=lambda path=path: download_switch_log(path)).props("outline")
                     ui.code(path.read_text(encoding="utf-8"), language="text").classes("w-full")
+                render_switch_diagnostics(result)
+
+    def render_switch_diagnostics(result):
+        text = result.get("ssh_diagnostics", {}).get("session_log", "")
+        if not text:
+            return
+        with ui.expansion(f"{result['name']} | {result['serial']} | SSH diagnostics").classes("w-full"):
+            ui.button("Download SSH diagnostics", icon="download",
+                      on_click=lambda text=text, serial=result["serial"]: download_ssh_diagnostics(text, serial)).props("outline")
+            ui.code(text[:60000], language="text").classes("w-full")
 
     def render_ssh_diagnostics(results):
         ssh_logs.clear()
         with ssh_logs:
             for result in results:
-                text = result.get("ssh_diagnostics", {}).get("session_log", "")
-                if not text:
-                    continue
-                with ui.expansion(f"SSH diagnostics | {result['name']} | {result['serial']}").classes("w-full"):
-                    ui.button("Download SSH diagnostics", icon="download",
-                              on_click=lambda text=text, serial=result["serial"]: download_ssh_diagnostics(text, serial)).props("outline")
-                    ui.code(text[:60000], language="text").classes("w-full")
+                render_switch_diagnostics(result)
 
     def download_ssh_diagnostics(text, serial):
         owner()
@@ -1871,13 +1992,13 @@ def telemetry_push_panel():
         try:
             owner()
             invalidate()
-            selection = telemetry_selection(config.value or "")
-            profile = profile_values()
+            selection = selection_values()
+            profile = active_profile()
             settings = push_settings()
             diagnostic_root = output_directory() / "telemetry" if settings["ssh_diagnostics"] else None
             values = switch_values(selection)
             api_values = saved_credentials("dashboard", profile["id"], "Nexus Dashboards")
-            connect_directly = bool(direct.value)
+            connect_directly = ssh_route.value == "direct"
             jump = {} if connect_directly else ssh_jump(profile["id"])
             log.clear()
             ssh_logs.clear()
@@ -1902,6 +2023,12 @@ def telemetry_push_panel():
 
             plans = await run.io_bound(work)
             owner()
+            if (active_profile() != profile or selection_values() != selection
+                    or (ssh_route.value == "direct") != connect_directly or push_settings() != settings):
+                raise ValueError("Dashboard, selection, SSH route, or settings changed during preview; preview again")
+            if ({plan["serial"] for plan in plans} != set(selection["switches"]["hosts"])
+                    or any(plan["fabric"] != fabric.value for plan in plans)):
+                raise ValueError("Switch inventory changed since connecting; reconnect and select switches again")
             state.update(plans=plans, profile=profile, selection=selection, direct=connect_directly, report=None)
             render_plans(plans)
             status.text = f"{len(plans)} switches ready. Review each template and source interface before pushing."
@@ -1926,9 +2053,9 @@ def telemetry_push_panel():
         busy(True)
         try:
             owner()
-            selection = telemetry_selection(config.value or "")
-            profile = profile_values()
-            connect_directly = bool(direct.value)
+            selection = selection_values()
+            profile = active_profile()
+            connect_directly = ssh_route.value == "direct"
             settings = push_settings()
             if (not state["plans"] or state["profile"] != profile or state["selection"] != selection
                     or state["direct"] != connect_directly):
@@ -1947,8 +2074,8 @@ def telemetry_push_panel():
             ):
                 return
             owner()
-            if (profile_values() != profile or telemetry_selection(config.value or "") != selection
-                    or bool(direct.value) != connect_directly or push_settings() != settings):
+            if (active_profile() != profile or selection_values() != selection
+                    or (ssh_route.value == "direct") != connect_directly or push_settings() != settings):
                 invalidate()
                 raise ValueError("Dashboard, selection, SSH route, or push settings changed during confirmation; preview again")
             directory = output_directory() / "telemetry" / uuid4().hex
@@ -1972,7 +2099,6 @@ def telemetry_push_panel():
             table.rows = results
             table.update()
             render_switch_logs(directory, results)
-            render_ssh_diagnostics(results)
             status.text = " | ".join(f"{sum(result['state'] == value for result in results)} {value}"
                                      for value in sorted({result["state"] for result in results}))
             status.text += " | Preview again before another push"
@@ -2007,9 +2133,25 @@ def telemetry_push_panel():
                  "Successful pushes save running-config to startup-config, including other unsaved changes. "
                  "Flow telemetry is not included; ND reception is not verified.").classes("muted")
         dashboard = dashboard_picker("Nexus Dashboard appliance")
-        direct = ui.switch("Connect directly to switches", value=False)
-        ui.label("Unchecked: SSH through the selected dashboard as rescue-user. "
-                 "Checked: SSH from this server directly to switches; no rescue-user password is required. "
+        connect_button = ui.button("Connect dashboard", icon="link", on_click=connect)
+        fabric = ui.select([], label="Fabric", clearable=True, with_input=True).props("outlined dense").classes("w-full")
+        ui.label("Select switches in the fabric using the checkboxes.").classes("muted")
+        switch_table = ui.table(columns=[{"name": key, "label": label, "field": key, "align": "left", "sortable": True}
+                                        for key, label in (("name", "Switch"), ("address", "Management IP"),
+                                                           ("serial", "Serial"))],
+                                rows=[], row_key="serial", selection="multiple", pagination=15,
+                                on_select=selection_changed).classes("w-full")
+        with ui.expansion("Optional source-interface overrides", icon="tune").classes("w-full"):
+            ui.label("For selected switches, enter an interface only when ND inventory or SSH discovery needs an override.").classes("muted")
+            override_fields = ui.column().classes("w-full")
+        with ui.row():
+            save_selection_button = ui.button("Save selection", icon="save", on_click=save_selection).props("outline")
+            load_selection_button = ui.button("Load saved selection", icon="restore", on_click=load_selection).props("outline")
+        ui.label("Saved selections are encrypted and private to your WebUI account. Previously saved YAML selections "
+                 "can be loaded after connecting; review them before previewing.").classes("muted")
+        ssh_route = ui.toggle({"direct": "Direct SSH", "nd": "SSH via Nexus Dashboard"}, value="nd")
+        ui.label("SSH via Nexus Dashboard: SSH through the selected dashboard as rescue-user. "
+                 "Direct SSH: SSH from this server directly to switches; no rescue-user password is required. "
                  "The selected dashboard and its API credentials are required in both modes.").classes("muted")
         with ui.expansion("Push settings", icon="tune").classes("w-full"):
             with ui.element("div").classes("form-grid"):
@@ -2024,28 +2166,22 @@ def telemetry_push_panel():
                      "and push, including failed logins. Download diagnostics below after running. "
                      "Both passwords are redacted; output can still contain device and network details.").classes("muted")
         ui.label("ND-to-switch SSH uses source interface bond0 (ssh -B bond0); direct SSH is unchanged.").classes("muted")
-        config = ui.textarea("Telemetry YAML configuration", value=saved_config.get("yaml", TELEMETRY_EXAMPLE)).props(
-            "outlined").classes("w-full code-input")
-        save_yaml_button = ui.button("Save YAML", icon="save", on_click=save_yaml).props("outline")
-        ui.label("Save YAML to restore this configuration when you return, including after signing in again. "
-                 "Saved YAML is encrypted and private to your WebUI account; passwords are saved separately.").classes("muted")
-        ui.label("Switches may be identified by ND name, management IP, or serial. "
-                 "The YAML username and automation password below are used for switch SSH, not ND API login. "
-                 "Inband discovery matches the ND management IP to a switch interface; "
-                 "use source_interfaces to override it, then preview again.").classes("muted")
-        password = ui.input("Automation password", password=True, password_toggle_button=True).props(
-            "outlined autocomplete=new-password").classes("w-full")
+        ui.label("These credentials are used for switch SSH, not ND API login.").classes("muted")
+        with ui.element("div").classes("form-grid"):
+            username = ui.input("Switch username", value=saved_switch.get("username", "")).props("outlined")
+            password = ui.input("Switch password", password=True, password_toggle_button=True).props(
+                "outlined autocomplete=new-password")
         with ui.row().classes("items-center gap-4"):
             use_saved = ui.checkbox("Use saved switch credentials", value=bool(saved_switch))
             remember = ui.switch("Remember encrypted switch credentials", value=False)
             save_credentials_button = ui.button("Save switch credentials", icon="save", on_click=save_switch_credentials).props("outline")
             forget_button = ui.button("Forget saved switch credentials", icon="key_off", on_click=forget).props("outline")
         credential_status = ui.label(
-            f"Encrypted switch credentials saved for {saved_switch['username']}; the YAML username must match"
+            f"Encrypted switch credentials saved for {saved_switch['username']}; the switch username must match"
             if saved_switch else "No saved switch credentials").classes("muted")
         ui.label("Save switch credentials stores the password now. Remember encrypted switch credentials "
-                 "stores it when you preview; it does not save the YAML.").classes("muted")
-        status = ui.label("Preview required").classes("muted")
+                 "stores it when you preview; it does not save the selection.").classes("muted")
+        status = ui.label("Not connected").classes("muted")
         with ui.row():
             preview_button = ui.button("Preview telemetry", icon="preview", on_click=preview).props("outline")
             push_button = ui.button("Push telemetry", icon="publish", color="negative", on_click=push)
@@ -2062,11 +2198,13 @@ def telemetry_push_panel():
         switch_logs = ui.column().classes("w-full")
         ssh_logs = ui.column().classes("w-full")
         ui.timer(0.2, drain_log)
-    controls = (dashboard, direct, workers, connect_timeout, read_timeout, ssh_diagnostics, config, save_yaml_button, password, use_saved, remember,
-                save_credentials_button, forget_button, preview_button, push_button)
+    controls = (dashboard, connect_button, fabric, save_selection_button, load_selection_button,
+                ssh_route, workers, connect_timeout, read_timeout, ssh_diagnostics, username, password, use_saved,
+                remember, save_credentials_button, forget_button, preview_button, push_button)
     dashboard.on_value_change(dashboard_changed)
-    direct.on_value_change(invalidate)
-    config.on_value_change(invalidate)
+    ssh_route.on_value_change(invalidate)
+    fabric.on_value_change(fabric_changed)
+    username.on_value_change(invalidate)
     return dashboard, dashboard_changed
 
 

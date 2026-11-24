@@ -472,34 +472,26 @@ software telemetry configuration from ND to a list of switches.
 
 1. Select an appliance configured on **Nexus Dashboards**. Its saved shared or
    overridden API credentials and **Rescue-user password** are used for ND.
-   **Connect directly to switches** is unchecked by default, using the ND
-   rescue-user SSH hop. Check it to connect from the application server directly
+   Choose **Direct SSH** or **SSH via Nexus Dashboard**, using the same selector
+   as ACI Checks. **SSH via Nexus Dashboard** is selected by default, using the ND
+   rescue-user SSH hop. Select **Direct SSH** to connect from the application server directly
    to switches for both interface discovery and telemetry push. Direct mode
    does not require the rescue-user password; the selected dashboard and its
    API credentials are still required to fetch inventory and templates.
-2. Provide the switch SSH username and switch list in the YAML editor:
-
-   ```yaml
-   switches:
-     username: netops
-     hosts:
-       - 192.0.2.101
-       - leaf2
-   source_interfaces: {}
-   ```
-
-   Hosts match ND management IPs, names, or serials. Missing, ambiguous, or
-   duplicate selections are rejected. Enter the separate switch **Automation
-   password** below the editor. Click **Save switch credentials** to save it
+2. Click **Connect dashboard**, choose a **Fabric**, and select one or more
+   switches using the table checkboxes. Enter the switch **Switch username** and
+   **Switch password**; these are separate from the ND API credentials.
+   Click **Save switch credentials** to save them
    immediately, without running a preview. **Remember encrypted switch credentials**
    saves the password when you preview, not when you toggle the switch.
    **Use saved switch credentials** reuses it only when the saved username matches
-   `switches.username` in the YAML; the page shows the saved username.
-   Click **Save YAML** to restore the editor contents when you return to the page
-   or sign in again. YAML and switch credentials are saved separately, encrypted,
-   and private to your WebUI account. Saving YAML does not save the password,
-   and forgetting switch credentials does not delete the saved YAML.
-   Passwords must not appear in YAML.
+   the switch username; the page shows the saved username.
+   **Save selection** saves the selected switches, username, and optional source
+   overrides separately from the password. After connecting, **Load saved selection**
+   restores them for review, including previously saved YAML selections whose
+   switches all belong to one fabric. Selections spanning multiple fabrics must
+   be selected one fabric at a time. Both saved selections and credentials are
+   encrypted and private to your WebUI account.
 3. **Preview telemetry** reads each switch's `sourceVrfName` and `sourceInterfaceName`
    from the paged `/api/v1/manage/inventory/switches` (`additionalData`), falling back to
    `/api/v1/manage/fabrics/<fabric>` `telemetrySourceVrf` (a missing value or `mgmt` means
@@ -510,22 +502,16 @@ software telemetry configuration from ND to a list of switches.
    and preserved alongside its feature and telemetry configuration.
    A `management` VRF leaves the ND template unchanged.
    For `default` (as returned in inband fabrics) and `inband`, the source interface is
-   taken from a YAML override, else the inventory `sourceInterfaceName`, else discovered
-   over SSH using the selected route and the YAML username and automation
+   taken from a user override, else the inventory `sourceInterfaceName`, else discovered
+   over SSH using the selected route and the switch username and
    password. Discovery requires the switch's ND management IP to
    match exactly one interface in `show ip interface brief vrf all` (or its IPv6
    equivalent); the fabric-level `telemetrySourceInterface` is not assumed to be
    correct for every switch.
 4. Review the per-switch interface and expandable configuration previews.
-   To override discovery or resolve a missing/ambiguous match, add an interface
-   keyed by the exact switch entry in `hosts`, then preview again:
-
-   ```yaml
-   source_interfaces:
-     192.0.2.101: Vlan64
-     leaf2: Loopback0
-   ```
-
+   To override discovery or resolve a missing/ambiguous match, expand
+   **Optional source-interface overrides**, enter an interface for the selected
+   switch, and preview again.
    For inband only, the `source-interface` inside
    `telemetry / destination-profile` is replaced. Other template content remains
    unchanged. An unsupported VRF or missing source-interface blocks preview.
@@ -544,8 +530,9 @@ software telemetry configuration from ND to a list of switches.
    Enable **Record SSH diagnostics (password-redacted)** to capture login stages,
    the switch SSH command, prompts, received output, and an escaped transcript tail.
    This is off by default and covers both preview interface discovery and push,
-   including login failures. Expand **SSH diagnostics** below the logs to view or
-   download each switch's diagnostics. Both switch and rescue-user passwords are
+   including login failures. Each switch's **SSH diagnostics** expansion appears
+   immediately after its configuration log, labeled `<switch-name> | <serial> | SSH diagnostics`.
+   Expand it to view or download diagnostics. Both switch and rescue-user passwords are
    redacted, but device and network details can remain; review before sharing.
    Preview diagnostics are saved in private `telemetry/<run-id>/preview-ssh.json`
    files under your account's run directory. Push diagnostics are included in the
@@ -556,8 +543,8 @@ software telemetry configuration from ND to a list of switches.
    `copy running-config startup-config` after each successful switch push.
    **This saves the entire running configuration, including unrelated unsaved changes.**
    A switch is marked **PUSHED** only after the CLI confirms the save completed.
-   Changing YAML, dashboard
-   settings, or the direct-connection option invalidates preview. On a CLI error,
+   Changing the switch selection, username, source overrides, dashboard
+   settings, or the SSH route invalidates preview. On a CLI error,
    no new switches are started; switches already in progress finish their
    configuration and save. Switches that have not started are marked
    **NOT_ATTEMPTED**. A failed switch may have partial changes.

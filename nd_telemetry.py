@@ -51,6 +51,12 @@ def source_interface(value: str) -> str:
     return value
 
 
+def validate_switch_username(username: str) -> str:
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_.@\\:-]+", username):
+        raise ValueError("Enter a valid switch SSH username")
+    return username
+
+
 def telemetry_selection(text: str) -> dict:
     try:
         config = yaml.safe_load(text)
@@ -62,8 +68,7 @@ def telemetry_selection(text: str) -> dict:
     switches = config.get("switches")
     if not isinstance(switches, dict) or set(switches) != {"username", "hosts"}:
         raise ValueError("switches must contain username and hosts")
-    if not isinstance(switches["username"], str) or not re.fullmatch(r"[A-Za-z0-9_.@\\:-]+", switches["username"]):
-        raise ValueError("Enter a valid switch SSH username in the YAML")
+    validate_switch_username(switches["username"])
     hosts = switches["hosts"]
     if not isinstance(hosts, list) or not hosts or any(
         not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", host) for host in hosts
@@ -360,7 +365,7 @@ class TelemetryPush:
             origin = "ND template unchanged"
             if vrf != "management":
                 interface = selection["source_interfaces"].get(switch["selected_as"], "")
-                origin = "YAML override"
+                origin = "User override"
                 if not interface and inventory_interface:
                     interface, origin = inventory_interface, "ND inventory sourceInterfaceName"
                 if not interface:
